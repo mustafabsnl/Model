@@ -1,0 +1,30 @@
+# TEKNOFEST SİHA - PC Eğitim Altyapısı
+# Gerekli Python Paketleri
+# Kurulum: pip install -r requirements.txt
+
+# ── Temel Paketler ───────────────────────────
+ultralytics>=8.0.0        # YOLO modelleri (YOLOv8)
+torch>=2.0.0              # PyTorch (CUDA versiyonunu ayrıca kurun!)
+torchvision>=0.15.0       # PyTorch görüntü işleme
+
+# ── Sistem İzleme ────────────────────────────
+pynvml>=11.5.0            # NVIDIA GPU izleme (sıcaklık, güç, VRAM)
+psutil>=5.9.0             # CPU/RAM/Disk izleme
+
+# ── Görselleştirme & Loglama ─────────────────
+rich>=13.0.0              # Zengin terminal çıktısı (renkli tablo, progress bar)
+pandas>=2.0.0             # CSV/tablo işleme
+matplotlib>=3.7.0         # Grafik oluşturma (ultralytics bağımlılığı)
+
+# ── Export Formatları (opsiyonel) ─────────────
+# onnx>=1.14.0            # ONNX export için (pip install onnx)
+# onnxruntime-gpu>=1.15.0 # ONNX GPU inference (pip install onnxruntime-gpu)
+# openvino>=2023.0        # Intel OpenVINO (pip install openvino)
+
+# ── NOT ──────────────────────────────────────
+# PyTorch CUDA versiyonu ayrıca kurulmalıdır!
+# CUDA 12.1 için:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# CUDA 12.4 için:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Güncel komut için: https://pytorch.org/get-started/locally/

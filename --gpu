@@ -1,0 +1,12 @@
+
+============================================================
+    TEKNOFEST SiHA - YOLO Egitim Sistemi
+    Yerel PC Egitim Altyapisi v1.0
+============================================================
+
+⚠️  GPU algılama hatası: 'torch._C._CudaDeviceProperties' object has no attribute 'total_mem'
+⚠️  GPU algılama hatası: 'torch._C._CudaDeviceProperties' object has no attribute 'total_mem'
+❌ GPU bulunamadı! CPU ile eğitim çok yavaş olacaktır.
+🔍 GPU otomatik algılandı → Profil: 3050_laptop
+❌ Veri seti dosyası bulunamadı: C:\Users\musta\OneDrive\Desktop\TEKNOFEST\PC_EGITIM_KODLARI\3050_laptop
+   Dosya yolunu kontrol edin.
