@@ -337,45 +337,43 @@ def _make_snapshot_callback(period: int, save_dir: Path):
 
 def _make_altitude_blur_callback(p_altitude: float = 0.3, p_motion: float = 0.2):
     """
-    İrtifa simülasyonu (downscale→upscale pikselleşme) ve
-    yönlü motion blur uygulayan batch-seviyesi augmentation callback'i.
+    on_train_start callback'i: trainer.preprocess_batch'i monkey-patch ederek
+    her batch'e irtifa simülasyonu ve motion blur uygular.
     """
     import random
     import torch.nn.functional as _F
 
-    def _on_train_batch_start(trainer):
-        batch = trainer.batch
-        if batch is None:
-            return
+    def _on_train_start(trainer):
+        _orig_preprocess = trainer.preprocess_batch
 
-        if isinstance(batch, dict):
-            imgs = batch.get("img")
-        elif isinstance(batch, (list, tuple)) and len(batch) > 0:
-            imgs = batch[0] if isinstance(batch[0], __import__("torch").Tensor) else None
-        else:
-            return
+        def _augmented_preprocess(batch):
+            batch = _orig_preprocess(batch)
+            imgs = batch.get("img") if isinstance(batch, dict) else None
+            if imgs is None or imgs.ndim != 4:
+                return batch
 
-        if imgs is None or imgs.ndim != 4:
-            return
+            b, c, h, w = imgs.shape
 
-        b, c, h, w = imgs.shape
+            if random.random() < p_altitude:
+                s = random.uniform(0.25, 0.5)
+                small = _F.interpolate(imgs, scale_factor=s, mode="bilinear", align_corners=False)
+                batch["img"] = _F.interpolate(small, size=(h, w), mode="bilinear", align_corners=False)
 
-        if random.random() < p_altitude:
-            scale = random.uniform(0.25, 0.5)
-            small = _F.interpolate(imgs, scale_factor=scale, mode="bilinear", align_corners=False)
-            imgs.copy_(_F.interpolate(small, size=(h, w), mode="bilinear", align_corners=False))
+            if random.random() < p_motion:
+                k = random.choice([3, 5, 7])
+                kernel = imgs.new_zeros(k, k)
+                if random.random() < 0.5:
+                    kernel[k // 2, :] = 1.0 / k
+                else:
+                    kernel[:, k // 2] = 1.0 / k
+                kernel = kernel.unsqueeze(0).unsqueeze(0).expand(c, -1, -1, -1)
+                batch["img"] = _F.conv2d(batch["img"], kernel, padding=k // 2, groups=c)
 
-        if random.random() < p_motion:
-            k_size = random.choice([3, 5, 7])
-            kernel = imgs.new_zeros(k_size, k_size)
-            if random.random() < 0.5:
-                kernel[k_size // 2, :] = 1.0 / k_size
-            else:
-                kernel[:, k_size // 2] = 1.0 / k_size
-            kernel = kernel.unsqueeze(0).unsqueeze(0).expand(c, -1, -1, -1)
-            imgs.copy_(_F.conv2d(imgs, kernel, padding=k_size // 2, groups=c))
+            return batch
 
-    return _on_train_batch_start
+        trainer.preprocess_batch = _augmented_preprocess
+
+    return _on_train_start
 
 
 # ============================================================================
@@ -438,7 +436,7 @@ def run_training(config: TrainingConfig):
     p_blur = getattr(config, "motion_blur_aug", 0.0)
     if p_alt > 0 or p_blur > 0:
         model.add_callback(
-            "on_train_batch_start",
+            "on_train_start",
             _make_altitude_blur_callback(p_altitude=p_alt, p_motion=p_blur),
         )
         print(f"🌤️  Altitude/Blur augmentation aktif: altitude={p_alt}, motion_blur={p_blur}")
