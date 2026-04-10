@@ -277,8 +277,27 @@ def _generate_training_plots(results_csv: Path, out_dir: Path):
         plt.close()
 
 
-def _make_snapshot_callback(period: int, save_dir: Path):
-    """Her *period* epoch'ta tam bir snapshot oluşturan Ultralytics callback'i döner."""
+def _make_snapshot_callbacks(period: int, save_dir: Path):
+    """Her *period* epoch'ta tam bir snapshot oluşturan callback çifti döner.
+
+    Returns:
+        (on_train_start_cb, on_fit_epoch_end_cb) — iki callback fonksiyonu.
+        on_train_start_cb: validator'a plots hook'u ekler.
+        on_fit_epoch_end_cb: asıl snapshot işlemini yapar.
+    """
+
+    def _on_train_start(trainer):
+        """Validator'a on_val_start hook'u ekle: snapshot epoch'larında plots=True zorla."""
+        v = getattr(trainer, "validator", None)
+        if v is None:
+            return
+
+        def _force_plots_for_snapshot(validator):
+            epoch = trainer.epoch + 1
+            if epoch % period == 0:
+                validator.args.plots = True
+
+        v.add_callback("on_val_start", _force_plots_for_snapshot)
 
     def _on_fit_epoch_end(trainer):
         epoch = trainer.epoch + 1  # 0-indexed → 1-indexed
@@ -288,7 +307,7 @@ def _make_snapshot_callback(period: int, save_dir: Path):
         snap_dir = save_dir / f"snapshot_epoch_{epoch}"
         snap_dir.mkdir(parents=True, exist_ok=True)
 
-        # Weights kopyala
+        # ── 1. Weights kopyala ──
         snap_weights = snap_dir / "weights"
         snap_weights.mkdir(exist_ok=True)
         src_weights = save_dir / "weights"
@@ -297,20 +316,47 @@ def _make_snapshot_callback(period: int, save_dir: Path):
             if src.exists():
                 shutil.copy2(str(src), str(snap_weights / name))
 
-        # results.csv, args.yaml kopyala
-        for fname in ("results.csv", "args.yaml", "training_config.json"):
-            src = save_dir / fname
-            if src.exists():
-                shutil.copy2(str(src), str(snap_dir / fname))
+        # ── 2. Mevcut tüm dosyaları kopyala (png, jpg, csv, yaml, json) ──
+        for pattern in ("*.png", "*.jpg", "*.csv", "*.yaml", "*.json"):
+            for src_file in save_dir.glob(pattern):
+                if src_file.is_file():
+                    shutil.copy2(str(src_file), str(snap_dir / src_file.name))
 
-        # Grafikleri oluştur
-        csv_path = snap_dir / "results.csv"
+        # ── 3. results.png'yi Ultralytics ile oluştur ──
         try:
-            _generate_training_plots(csv_path, snap_dir)
+            from ultralytics.utils.plotting import plot_results as _ul_plot_results
+            _ul_plot_results(file=snap_dir / "results.csv", dir=snap_dir, on_plot=None)
+        except Exception:
+            pass
+
+        # ── 4. Confusion Matrix oluştur ──
+        try:
+            v = trainer.validator
+            if v and hasattr(v, "confusion_matrix") and v.confusion_matrix is not None:
+                v.confusion_matrix.plot(
+                    save_dir=snap_dir, normalize=False, on_plot=None,
+                )
+                v.confusion_matrix.plot(
+                    save_dir=snap_dir, normalize=True, on_plot=None,
+                )
+        except Exception as exc:
+            print(f"  ⚠️  Confusion matrix hatası (epoch {epoch}): {exc}")
+
+        # ── 5. F1 / P / R / PR eğrileri oluştur ──
+        try:
+            v = trainer.validator
+            if v and hasattr(v, "metrics"):
+                _generate_val_curves(v.metrics, snap_dir, trainer.data)
+        except Exception as exc:
+            print(f"  ⚠️  Curve grafik hatası (epoch {epoch}): {exc}")
+
+        # ── 6. Kendi eğitim grafikleri (loss, metric, LR) ──
+        try:
+            _generate_training_plots(snap_dir / "results.csv", snap_dir)
         except Exception as exc:
             print(f"  ⚠️  Snapshot grafik hatası (epoch {epoch}): {exc}")
 
-        # Metrik özeti kaydet
+        # ── 7. Metrik özeti kaydet ──
         metrics = {}
         if hasattr(trainer, "metrics") and trainer.metrics:
             metrics = {
@@ -328,7 +374,51 @@ def _make_snapshot_callback(period: int, save_dir: Path):
 
         print(f"\n📸 Snapshot kaydedildi: {snap_dir}")
 
-    return _on_fit_epoch_end
+    return _on_train_start, _on_fit_epoch_end
+
+
+def _generate_val_curves(metrics, snap_dir: Path, data: dict):
+    """Validator metrics'ten BoxF1, BoxP, BoxPR, BoxR eğrilerini üretir."""
+    try:
+        from ultralytics.utils.metrics import plot_pr_curve, plot_mc_curve
+    except ImportError:
+        return
+
+    names = data.get("names", {})
+    box = getattr(metrics, "box", None)
+    if box is None:
+        return
+
+    px = getattr(box, "px", None)
+    if px is None or not hasattr(px, "__len__") or len(px) == 0:
+        return
+
+    prec_values = getattr(box, "prec_values", None)
+    f1_curve = getattr(box, "f1_curve", None)
+    p_curve = getattr(box, "p_curve", None)
+    r_curve = getattr(box, "r_curve", None)
+    all_ap = getattr(box, "all_ap", None)
+    ap50 = all_ap[:, 0] if all_ap is not None and hasattr(all_ap, "ndim") and all_ap.ndim >= 2 else None
+
+    if prec_values is not None:
+        try:
+            plot_pr_curve(px, prec_values, ap50,
+                          save_dir=snap_dir / "BoxPR_curve.png",
+                          names=names, on_plot=None)
+        except Exception:
+            pass
+
+    for arr, fname, ylabel in [
+        (f1_curve, "BoxF1_curve.png", "F1"),
+        (p_curve, "BoxP_curve.png", "Precision"),
+        (r_curve, "BoxR_curve.png", "Recall"),
+    ]:
+        if arr is not None:
+            try:
+                plot_mc_curve(px, arr, save_dir=snap_dir / fname,
+                              names=names, ylabel=ylabel, on_plot=None)
+            except Exception:
+                pass
 
 
 # ============================================================================
@@ -425,11 +515,10 @@ def run_training(config: TrainingConfig):
     # ── Snapshot callback ekle ────────────────────────────────────
     snap_period = config.save_period
     if snap_period and snap_period > 0:
-        model.add_callback(
-            "on_fit_epoch_end",
-            _make_snapshot_callback(snap_period, output_dir),
-        )
-        print(f"📸 Snapshot sistemi aktif: her {snap_period} epoch'ta tam kayıt")
+        snap_train_start, snap_epoch_end = _make_snapshot_callbacks(snap_period, output_dir)
+        model.add_callback("on_train_start", snap_train_start)
+        model.add_callback("on_fit_epoch_end", snap_epoch_end)
+        print(f"📸 Snapshot sistemi aktif: her {snap_period} epoch'ta tam kayıt (grafikler dahil)")
 
     # ── Altitude / Blur augmentation callback ekle ───────────────
     p_alt = getattr(config, "altitude_aug", 0.0)
