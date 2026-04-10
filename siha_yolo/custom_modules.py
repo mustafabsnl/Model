@@ -24,11 +24,13 @@ class SimAM(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.ndim != 4:
             return x
-        mu = x.mean(dim=(2, 3), keepdim=True)
-        x_mu = x - mu
+        dtype = x.dtype
+        x_f = x.float()
+        mu = x_f.mean(dim=(2, 3), keepdim=True)
+        x_mu = x_f - mu
         var = (x_mu * x_mu).mean(dim=(2, 3), keepdim=True)
         e = (x_mu * x_mu) / (4.0 * (var + self.e_lambda)) + 0.5
-        return x * torch.sigmoid(e)
+        return x * torch.sigmoid(e).to(dtype)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -65,7 +67,10 @@ class SwinC2f(nn.Module):
         self.tr = TransformerBlock(c2, c2, num_heads=num_heads, num_layers=num_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.tr(self.cv(x))
+        out = self.cv(x)
+        dtype = out.dtype
+        out = self.tr(out.float())
+        return out.to(dtype)
 
 
 # ═══════════════════════════════════════════════════════════════

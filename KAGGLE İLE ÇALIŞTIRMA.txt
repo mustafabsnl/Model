@@ -1,0 +1,34 @@
+!git clone https://github.com/mustafabsnl/Model.git
+%cd /kaggle/working/Model/PC_EGITIM_KODLARI
+!pip install -q ultralytics
+
+
+
+
+import kagglehub
+import os
+
+path = kagglehub.dataset_download("furkanbt/unmanned-aerial-vehicle-uav-dataset")
+print("Dataset yolu:", path)
+
+# data.yaml'ı bul
+for root, dirs, files in os.walk(path):
+    for f in files:
+        if f.endswith(".yaml"):
+            DATA_YAML = os.path.join(root, f)
+            print("data.yaml:", DATA_YAML)
+            break
+
+
+
+
+
+!cd /kaggle/working/Model && python train.py \
+  --data {DATA_YAML} \
+  --model siha_yolo/siha_yolov8_p2.yaml \
+  --weights yolov8s.pt \
+  --imgsz 640 \
+  --epochs 10 \
+  --batch -1 \
+  --workers 4 \
+  --name test_run
