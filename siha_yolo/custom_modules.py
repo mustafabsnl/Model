@@ -72,7 +72,8 @@ class SwinC2f(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.cv(x)
         dtype = out.dtype
-        out = self.tr(out.float())
+        with torch.amp.autocast("cuda", enabled=False):
+            out = self.tr(out.float())
         return out.to(dtype)
 
 
