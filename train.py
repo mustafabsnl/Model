@@ -25,7 +25,9 @@ Kullanım:
 """
 
 import argparse
+import csv
 import os
+import shutil
 import sys
 import time
 import signal
@@ -192,6 +194,191 @@ def validate_weights_path(weights_path: str) -> str:
 
 
 # ============================================================================
+# Periyodik Snapshot Sistemi
+# ============================================================================
+
+def _generate_training_plots(results_csv: Path, out_dir: Path):
+    """results.csv'den loss, metrik ve LR grafiklerini üretir."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not results_csv.exists():
+        return
+
+    data: dict[str, list[float]] = {}
+    with open(str(results_csv), "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            for key, val in row.items():
+                key = key.strip()
+                try:
+                    data.setdefault(key, []).append(float(val))
+                except (ValueError, AttributeError):
+                    pass
+
+    if not data:
+        return
+
+    n = len(next(iter(data.values())))
+    epochs = data.get("epoch", list(range(1, n + 1)))
+
+    # ── Loss eğrileri ──
+    loss_groups = [
+        ("train/box_loss", "val/box_loss", "Box Loss"),
+        ("train/cls_loss", "val/cls_loss", "Cls Loss"),
+        ("train/dfl_loss", "val/dfl_loss", "DFL Loss"),
+    ]
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for ax, (tk, vk, title) in zip(axes, loss_groups):
+        if tk in data:
+            ax.plot(epochs[: len(data[tk])], data[tk], label="train")
+        if vk in data:
+            ax.plot(epochs[: len(data[vk])], data[vk], label="val")
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(str(out_dir / "loss_curves.png"), dpi=150)
+    plt.close()
+
+    # ── Metrik eğrileri ──
+    metric_pairs = [
+        ("metrics/precision(B)", "Precision"),
+        ("metrics/recall(B)", "Recall"),
+        ("metrics/mAP50(B)", "mAP50"),
+        ("metrics/mAP50-95(B)", "mAP50-95"),
+    ]
+    available = [(k, t) for k, t in metric_pairs if k in data]
+    if available:
+        fig, axes = plt.subplots(1, len(available), figsize=(5 * len(available), 4))
+        if len(available) == 1:
+            axes = [axes]
+        for ax, (key, title) in zip(axes, available):
+            ax.plot(epochs[: len(data[key])], data[key], color="tab:blue", marker=".")
+            ax.set_title(title)
+            ax.set_xlabel("Epoch")
+            ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(str(out_dir / "metric_curves.png"), dpi=150)
+        plt.close()
+
+    # ── Learning Rate ──
+    lr_key = "lr/pg0"
+    if lr_key in data:
+        plt.figure(figsize=(8, 4))
+        plt.plot(epochs[: len(data[lr_key])], data[lr_key])
+        plt.title("Learning Rate")
+        plt.xlabel("Epoch")
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(str(out_dir / "lr_curve.png"), dpi=150)
+        plt.close()
+
+
+def _make_snapshot_callback(period: int, save_dir: Path):
+    """Her *period* epoch'ta tam bir snapshot oluşturan Ultralytics callback'i döner."""
+
+    def _on_fit_epoch_end(trainer):
+        epoch = trainer.epoch + 1  # 0-indexed → 1-indexed
+        if epoch % period != 0:
+            return
+
+        snap_dir = save_dir / f"snapshot_epoch_{epoch}"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+
+        # Weights kopyala
+        snap_weights = snap_dir / "weights"
+        snap_weights.mkdir(exist_ok=True)
+        src_weights = save_dir / "weights"
+        for name in ("best.pt", "last.pt"):
+            src = src_weights / name
+            if src.exists():
+                shutil.copy2(str(src), str(snap_weights / name))
+
+        # results.csv, args.yaml kopyala
+        for fname in ("results.csv", "args.yaml", "training_config.json"):
+            src = save_dir / fname
+            if src.exists():
+                shutil.copy2(str(src), str(snap_dir / fname))
+
+        # Grafikleri oluştur
+        csv_path = snap_dir / "results.csv"
+        try:
+            _generate_training_plots(csv_path, snap_dir)
+        except Exception as exc:
+            print(f"  ⚠️  Snapshot grafik hatası (epoch {epoch}): {exc}")
+
+        # Metrik özeti kaydet
+        metrics = {}
+        if hasattr(trainer, "metrics") and trainer.metrics:
+            metrics = {
+                k: round(v, 4) if isinstance(v, float) else v
+                for k, v in trainer.metrics.items()
+            }
+
+        summary = {
+            "epoch": epoch,
+            "timestamp": datetime.now().isoformat(),
+            "metrics": metrics,
+        }
+        with open(str(snap_dir / "snapshot_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+
+        print(f"\n📸 Snapshot kaydedildi: {snap_dir}")
+
+    return _on_fit_epoch_end
+
+
+# ============================================================================
+# Altitude / Motion-Blur Augmentation Callback
+# ============================================================================
+
+def _make_altitude_blur_callback(p_altitude: float = 0.3, p_motion: float = 0.2):
+    """
+    İrtifa simülasyonu (downscale→upscale pikselleşme) ve
+    yönlü motion blur uygulayan batch-seviyesi augmentation callback'i.
+    """
+    import random
+    import torch.nn.functional as _F
+
+    def _on_train_batch_start(trainer):
+        batch = trainer.batch
+        if batch is None:
+            return
+
+        if isinstance(batch, dict):
+            imgs = batch.get("img")
+        elif isinstance(batch, (list, tuple)) and len(batch) > 0:
+            imgs = batch[0] if isinstance(batch[0], __import__("torch").Tensor) else None
+        else:
+            return
+
+        if imgs is None or imgs.ndim != 4:
+            return
+
+        b, c, h, w = imgs.shape
+
+        if random.random() < p_altitude:
+            scale = random.uniform(0.25, 0.5)
+            small = _F.interpolate(imgs, scale_factor=scale, mode="bilinear", align_corners=False)
+            imgs.copy_(_F.interpolate(small, size=(h, w), mode="bilinear", align_corners=False))
+
+        if random.random() < p_motion:
+            k_size = random.choice([3, 5, 7])
+            kernel = imgs.new_zeros(k_size, k_size)
+            if random.random() < 0.5:
+                kernel[k_size // 2, :] = 1.0 / k_size
+            else:
+                kernel[:, k_size // 2] = 1.0 / k_size
+            kernel = kernel.unsqueeze(0).unsqueeze(0).expand(c, -1, -1, -1)
+            imgs.copy_(_F.conv2d(imgs, kernel, padding=k_size // 2, groups=c))
+
+    return _on_train_batch_start
+
+
+# ============================================================================
 # Eğitim Fonksiyonu
 # ============================================================================
 
@@ -237,6 +424,25 @@ def run_training(config: TrainingConfig):
             model = model.load(config.weights)
         train_args = config_to_train_args(config)
     
+    # ── Snapshot callback ekle ────────────────────────────────────
+    snap_period = config.save_period
+    if snap_period and snap_period > 0:
+        model.add_callback(
+            "on_fit_epoch_end",
+            _make_snapshot_callback(snap_period, output_dir),
+        )
+        print(f"📸 Snapshot sistemi aktif: her {snap_period} epoch'ta tam kayıt")
+
+    # ── Altitude / Blur augmentation callback ekle ───────────────
+    p_alt = getattr(config, "altitude_aug", 0.0)
+    p_blur = getattr(config, "motion_blur_aug", 0.0)
+    if p_alt > 0 or p_blur > 0:
+        model.add_callback(
+            "on_train_batch_start",
+            _make_altitude_blur_callback(p_altitude=p_alt, p_motion=p_blur),
+        )
+        print(f"🌤️  Altitude/Blur augmentation aktif: altitude={p_alt}, motion_blur={p_blur}")
+
     # ── Eğitimi başlat ───────────────────────────────────────────
     print(f"\n{'='*60}")
     print(f"🚀 EĞİTİM BAŞLIYOR!")

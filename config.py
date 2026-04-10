@@ -114,6 +114,8 @@ class TrainingConfig:
     mixup: float = 0.1             # MixUp augmentation
     close_mosaic: int = 10         # Son N epoch mosaic kapat
     erasing: float = 0.4           # Random erasing
+    altitude_aug: float = 0.3      # İrtifa simülasyonu olasılığı (downscale+upscale)
+    motion_blur_aug: float = 0.2   # Motion blur olasılığı
     
     # ── Kayıt ve Çıktı ───────────────────────────────────────────────
     project: str = ""              # Çıktı proje dizini
@@ -311,7 +313,8 @@ def print_config(config: TrainingConfig):
                        "patience", "save_period", "warmup_epochs"],
         "🔄 Augmentation": ["hsv_h", "hsv_s", "hsv_v", "degrees", "translate",
                             "scale", "fliplr", "flipud", "mosaic", "mixup",
-                            "close_mosaic", "erasing"],
+                            "close_mosaic", "erasing",
+                            "altitude_aug", "motion_blur_aug"],
         "📁 Çıktı": ["project", "name", "plots", "save", "val"],
     }
     

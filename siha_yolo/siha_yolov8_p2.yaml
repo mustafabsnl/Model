@@ -1,91 +1,89 @@
-# SİHA-YOLOv8 — P2 Head (4 Tespit Kafası) Model Konfigürasyonu
-# ==============================================================
+# SİHA-YOLOv8 — Tam Mimari (P2 Head + Tüm Modüller)
+# ====================================================================
 #
-# Standart YOLOv8:  3 kafa (P3, P4, P5) → stride 8, 16, 32
-# SİHA-YOLOv8:     4 kafa (P2, P3, P4, P5) → stride 4, 8, 16, 32
+# model_mimari_plan.md'deki tüm modüller implementasyonu:
 #
-# P2 eklenmesinin amacı:
-#   - P2 özellik haritası 160×160 (640 girişte) → en yüksek çözünürlük
-#   - Birkaç piksellik küçük nesneleri (uzaktaki İHA) yakalayabilir
-#   - MSW-YOLO makalesinde VisDrone'da ciddi mAP artışı kanıtlanmış
+# BACKBONE: LEM, DSConv, DilatedConv, SwinC2f, C2f, SPPF
+# NECK:     BiFPN (BiFPNAdd), SimAM, CSSF, FFM, ASFF
+# HEAD:     4 kafa (P2, P3, P4, P5) — stride 4, 8, 16, 32
 #
-# UYARI: P2 Head bellek kullanımını artırır!
-#   - Standart:  8400 anchor nokta
-#   - P2 ekli:  34000 anchor nokta (~4x artış)
-#   - Kaggle T4 (16GB) için yolov8n (nano) ölçeği önerilir
-#
-# Kullanım:
-#   from ultralytics import YOLO
-#   model = YOLO('siha_yolov8_p2.yaml').load('yolov8n.pt')
+# Toplam 44 layer  |  Scales: n / s / m
+# ====================================================================
 
-# Sınıf sayısı — data.yaml'dan override edilir
 nc: 8
 
-# Ölçek çarpanları [depth, width, max_channels]
-# n=nano → Kaggle T4 uyumlu, hafif ama P2 ile güçlü
 scales:
   n: [0.33, 0.25, 1024]
   s: [0.33, 0.50, 1024]
   m: [0.67, 0.75, 768]
 
 # ====================================================================
-# BACKBONE — Özellik çıkarım omurgası (standart YOLOv8 ile aynı)
+# BACKBONE (11 layer, idx 0-10)
 # ====================================================================
 backbone:
-  # [from, repeats, module, args]
-  - [-1, 1, Conv, [64, 3, 2]]       # 0: P1/2   → 320×320
-  - [-1, 1, Conv, [128, 3, 2]]      # 1: P2/4   → 160×160
-  - [-1, 3, C2f, [128, True]]       # 2: P2 özellikleri ← P2 HEAD BURADAN BESLENECEK
-  - [-1, 1, Conv, [256, 3, 2]]      # 3: P3/8   → 80×80
-  - [-1, 6, C2f, [256, True]]       # 4: P3 özellikleri
-  - [-1, 1, Conv, [512, 3, 2]]      # 5: P4/16  → 40×40
-  - [-1, 6, C2f, [512, True]]       # 6: P4 özellikleri
-  - [-1, 1, Conv, [1024, 3, 2]]     # 7: P5/32  → 20×20
-  - [-1, 1, SwinC2f, [1024, 8, 1]]  # 8: Swin-C2f (son blok, global bağlam)
-  - [-1, 1, SPPF, [1024, 5]]        # 9: SPPF (Spatial Pyramid Pooling)
+  - [-1, 1, Conv, [64, 3, 2]]              # 0: Stem P1/2 → 320×320
+  - [-1, 1, LEM, [128, 3, 2]]              # 1: P2/4 → 160×160  (hafif downsample)
+  - [-1, 3, C2f, [128, True]]              # 2: P2 özellikleri  ← HEAD REF
+  - [-1, 1, LEM, [256, 3, 2]]              # 3: P3/8 → 80×80   (hafif downsample)
+  - [-1, 6, C2f, [256, True]]              # 4: P3 özellikleri  ← HEAD REF
+  - [-1, 1, DSConv, [512, 3, 2]]           # 5: P4/16 → 40×40  (yapısal detay)
+  - [-1, 6, C2f, [512, True]]              # 6: P4 özellikleri
+  - [-1, 1, DilatedConv, [512, 3, 1, 2]]   # 7: P4 receptive field genişletme ← HEAD REF
+  - [-1, 1, Conv, [1024, 3, 2]]            # 8: P5/32 → 20×20
+  - [-1, 1, SwinC2f, [1024, 8, 1]]         # 9: Global bağlam (transformer)
+  - [-1, 1, SPPF, [1024, 5]]               # 10: Spatial Pyramid Pooling ← HEAD REF
 
 # ====================================================================
-# HEAD — Top-Down + Bottom-Up FPN/PAN ile P2 Head
+# HEAD (33 layer, idx 11-43)
 # ====================================================================
 head:
-  # ── Top-Down Yolu (FPN — yüksek seviye bilgiyi aşağıya taşır) ──
+  # ── Top-Down: P5 → P4 ──────────────────────────────────────
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]     # 11
+  - [-1, 1, Conv, [512, 1, 1]]                     # 12: proj
+  - [[-1, 7], 1, BiFPNAdd, [2]]                    # 13: fuse(P5_up, P4_dilated)
+  - [-1, 3, C2f, [512]]                             # 14: P4 fused
+  - [-1, 1, SimAM, []]                              # 15: attention
 
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 10: P5 → P4 boyutuna
-  - [-1, 1, Conv, [512, 1, 1]]                   # 11: P5_up proj → 512 (BiFPN)
-  - [[-1, 6], 1, BiFPNAdd, [2]]                  # 12: weighted fuse (P5_up, P4)
-  - [-1, 3, C2f, [512]]                           # 13: P4 fused
-  - [-1, 1, SimAM, []]                            # 14: attention (parametresiz)
+  # ── Top-Down: P4 → P3 ──────────────────────────────────────
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]     # 16
+  - [-1, 1, Conv, [256, 1, 1]]                     # 17: proj
+  - [[-1, 4], 1, BiFPNAdd, [2]]                    # 18: fuse(P4_up, backbone_P3)
+  - [-1, 3, C2f, [256]]                             # 19: P3 fused
+  - [-1, 1, SimAM, []]                              # 20: attention
 
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 15: P4 → P3 boyutuna
-  - [-1, 1, Conv, [256, 1, 1]]                   # 16: P4_up proj → 256 (BiFPN)
-  - [[-1, 4], 1, BiFPNAdd, [2]]                  # 17: weighted fuse (P4_up, P3)
-  - [-1, 3, C2f, [256]]                           # 18: P3 fused
-  - [-1, 1, SimAM, []]                            # 19: attention (parametresiz)
+  # ── Top-Down: P3 → P2 ──────────────────────────────────────
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]     # 21
+  - [-1, 1, Conv, [128, 1, 1]]                     # 22: proj
+  - [[-1, 2], 1, BiFPNAdd, [2]]                    # 23: fuse(P3_up, backbone_P2)
+  - [-1, 3, C2f, [128]]                             # 24: P2 fused
+  - [-1, 1, SimAM, []]                              # 25: attention
 
-  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]   # 20: P3 → P2 boyutuna     ← YENİ
-  - [-1, 1, Conv, [128, 1, 1]]                   # 21: P3_up proj → 128 (BiFPN)
-  - [[-1, 2], 1, BiFPNAdd, [2]]                  # 22: weighted fuse (P3_up, P2)
-  - [-1, 3, C2f, [128]]                           # 23: P2 fused             ← YENİ
-  - [-1, 1, SimAM, []]                            # 24: attention (parametresiz)
+  # ── CSSF: P5 → P2 doğrudan skip füzyonu ────────────────────
+  - [[10, 25], 1, CSSF, []]                         # 26: P5(SPPF) → P2 köprü
 
-  # ── Bottom-Up Yolu (PAN — düşük seviye detayı yukarıya taşır) ──
+  # ── Bottom-Up: P2 → P3 + FFM ───────────────────────────────
+  - [-1, 1, Conv, [256, 3, 2]]                     # 27: downsample
+  - [[-1, 19], 1, BiFPNAdd, [2]]                   # 28: fuse(P2_down, TD_P3)
+  - [-1, 3, C2f, [256]]                             # 29
+  - [[-1, 4], 1, FFM, []]                           # 30: FFM(neck_P3, backbone_P3)
 
-  - [-1, 1, Conv, [256, 3, 2]]                    # 25: P2 → P3 boyutuna (BiFPN)
-  - [[-1, 18], 1, BiFPNAdd, [2]]                  # 26: weighted fuse (P2_down, P3)
-  - [-1, 3, C2f, [256]]                           # 27: P3 final
+  # ── Bottom-Up: P3 → P4 + FFM ───────────────────────────────
+  - [-1, 1, Conv, [512, 3, 2]]                     # 31: downsample
+  - [[-1, 14], 1, BiFPNAdd, [2]]                   # 32: fuse(P3_down, TD_P4)
+  - [-1, 3, C2f, [512]]                             # 33
+  - [[-1, 7], 1, FFM, []]                           # 34: FFM(neck_P4, backbone_P4_dilated)
 
-  - [-1, 1, Conv, [512, 3, 2]]                    # 28: P3 → P4 boyutuna (BiFPN)
-  - [[-1, 13], 1, BiFPNAdd, [2]]                  # 29: weighted fuse (P3_down, P4)
-  - [-1, 3, C2f, [512]]                           # 30: P4 final
+  # ── Bottom-Up: P4 → P5 + FFM ───────────────────────────────
+  - [-1, 1, Conv, [1024, 3, 2]]                    # 35: downsample
+  - [[-1, 10], 1, BiFPNAdd, [2]]                   # 36: fuse(P4_down, SPPF)
+  - [-1, 3, C2f, [1024]]                            # 37
+  - [[-1, 10], 1, FFM, []]                          # 38: FFM(neck_P5, SPPF)
 
-  - [-1, 1, Conv, [1024, 3, 2]]                   # 31: P4 → P5 boyutuna (BiFPN)
-  - [[-1, 9], 1, BiFPNAdd, [2]]                   # 32: weighted fuse (P4_down, P5 SPPF)
-  - [-1, 3, C2f, [1024]]                          # 33: P5 final
+  # ── ASFF: Adaptive füzyon (Detect öncesi) ──────────────────
+  - [[26, 30, 34, 38], 1, ASFF, [0]]               # 39: ASFF P2
+  - [[26, 30, 34, 38], 1, ASFF, [1]]               # 40: ASFF P3
+  - [[26, 30, 34, 38], 1, ASFF, [2]]               # 41: ASFF P4
+  - [[26, 30, 34, 38], 1, ASFF, [3]]               # 42: ASFF P5
 
-  # ── 4 Başlı Tespit (P2 + P3 + P4 + P5) ──
-
-  - [[23, 27, 30, 33], 1, Detect, [nc]]           # 34: 4-head detect
-  #   P2 (stride 4):  küçük nesneler — uzaktaki İHA
-  #   P3 (stride 8):  küçük-orta nesneler
-  #   P4 (stride 16): orta nesneler
-  #   P5 (stride 32): büyük nesneler
+  # ── 4 Başlı Tespit ─────────────────────────────────────────
+  - [[39, 40, 41, 42], 1, Detect, [nc]]            # 43: P2+P3+P4+P5

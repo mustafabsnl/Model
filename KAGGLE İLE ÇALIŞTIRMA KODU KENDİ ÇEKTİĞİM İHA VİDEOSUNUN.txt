@@ -1,0 +1,36 @@
+!git clone https://github.com/mustafabsnl/Model.git
+%cd /kaggle/working/Model/PC_EGITIM_KODLARI
+!pip install -q ultralytics
+
+
+
+
+
+!pip install -q roboflow
+
+from roboflow import Roboflow
+import os
+
+rf = Roboflow(api_key="nRPj4surelJrYNPgeWUv")
+project = rf.workspace("mustafas-workspace-tfwpl").project("iha-zxgae-wdcrr")
+version = project.version(1)
+dataset = version.download("yolov8")
+
+DATA_YAML = os.path.join(dataset.location, "data.yaml")
+print("data.yaml:", DATA_YAML)
+
+
+
+
+
+
+!cd /kaggle/working/Model && python train.py \
+  --data {DATA_YAML} \
+  --model siha_yolo/siha_yolov8_p2.yaml \
+  --weights yolov8s.pt \
+  --imgsz 640 \
+  --epochs 2 \
+  --batch -1 \
+  --workers 4 \
+  --no-amp \
+  --name test_run

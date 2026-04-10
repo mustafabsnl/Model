@@ -1,6 +1,6 @@
 # 🛩️ YOLOv8 Özelleştirilmiş Model Mimarisi — TEKNOFEST Savaşan İHA 2026
 
-> **Amaç:** Rakip İHA'ları ve yer hedefini (QR kod) gerçek zamanlı tespit + 4 saniyelik otonom kilitlenme  
+> **Amaç:** Rakip İHA'ları ve yer hedefini (QR kod) gerçek zamanlı tespit + 4 saniyelik otonom kilitlenme
 > **Platform:** NVIDIA Jetson (edge deployment)  
 > **Temel Model:** YOLOv8 (Anchor-Free, Decoupled Head)  
 > **Referans Makaleler:** MSW-YOLO, Swin-YOLOv8, + diğer İHA tespit makaleleri
@@ -11,7 +11,7 @@
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        GİRİŞ GÖRÜNTÜSÜ                        │
+│                        GİRİŞ GÖRÜNTÜSÜ                          │
 │                        (640×480, 15+ FPS)                       │
 └───────────────────────────┬─────────────────────────────────────┘
                             │
