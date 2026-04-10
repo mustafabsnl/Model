@@ -682,6 +682,8 @@ GPU Profilleri:
     training.add_argument("--patience", type=int, default=None, help="Early stopping patience")
     training.add_argument("--optimizer", type=str, default=None, choices=["SGD", "Adam", "AdamW", "auto"], help="Optimizer")
     training.add_argument("--lr0", type=float, default=None, help="Başlangıç learning rate")
+    training.add_argument("--lrf", type=float, default=None, help="Final learning rate oranı (lr0 * lrf)")
+    training.add_argument("--warmup-epochs", type=float, default=None, help="Warmup epoch sayısı")
     
     # Resume
     resume_grp = parser.add_argument_group("Devam Etme (Resume)")
@@ -762,6 +764,8 @@ def main():
             "patience": args.patience,
             "optimizer": args.optimizer,
             "lr0": args.lr0,
+            "lrf": args.lrf,
+            "warmup_epochs": args.warmup_epochs,
             "save_period": args.save_period,
             "mosaic": args.mosaic,
             "mixup": args.mixup,
