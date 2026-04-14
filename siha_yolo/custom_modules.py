@@ -49,7 +49,9 @@ class BiFPNAdd(nn.Module):
     def forward(self, x):
         if not isinstance(x, (list, tuple)) or len(x) < 2:
             return x if not isinstance(x, (list, tuple)) else x[0]
-        w = torch.relu(self.w[: len(x)])
+        # AMP uyumu: input FP16 olabilir, weight'leri aynı dtype'a cast et
+        dtype = x[0].dtype
+        w = torch.relu(self.w[: len(x)]).to(dtype)
         w = w / (w.sum() + self.eps)
         out = x[0] * w[0]
         for i in range(1, len(x)):
@@ -61,18 +63,58 @@ class BiFPNAdd(nn.Module):
 # SwinC2f — Backbone son bloğu için global-bağlam transformer
 # ═══════════════════════════════════════════════════════════════
 
+class _SwinC2fAttention(nn.Module):
+    """
+    Saf PyTorch MHSA bloğu — hiçbir Ultralytics iç modülüne bağımlı değil.
+    B×C×H×W → (B, H*W, C) → MultiheadAttention → B×C×H×W
+    """
+    def __init__(self, c: int, num_heads: int, num_layers: int):
+        super().__init__()
+        # num_heads, c'yi tam bölmeli; küçük channel'larda otomatik düzelt
+        nh = num_heads
+        while c % nh != 0 and nh > 1:
+            nh //= 2
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=c,
+                nhead=nh,
+                dim_feedforward=c * 4,
+                dropout=0.0,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,    # Pre-LN → eğitim stabilitesi
+            )
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        # Flatten uzamsal boyutlar: (B, H*W, C)
+        seq = x.flatten(2).permute(0, 2, 1)
+        for layer in self.layers:
+            seq = layer(seq)
+        # Geri şekillendir: (B, C, H, W)
+        return seq.permute(0, 2, 1).view(B, C, H, W)
+
+
 class SwinC2f(nn.Module):
+    """
+    Backbone son bloğu için Global-Bağlam Transformer.
+    Saf PyTorch MHSA kullanır — herhangi bir Ultralytics sürümünde çalışır.
+    AMP uyumlu: attention kısmı otomatik olarak float32'de hesaplanır.
+    """
     def __init__(self, c1: int, c2: int, num_heads: int = 8, num_layers: int = 1):
         super().__init__()
         from ultralytics.nn.modules.conv import Conv
-        from ultralytics.nn.modules.transformer import TransformerBlock
         self.cv = Conv(c1, c2, k=1, s=1)
-        self.tr = TransformerBlock(c2, c2, num_heads=num_heads, num_layers=num_layers)
+        self.tr = _SwinC2fAttention(c2, num_heads=num_heads, num_layers=num_layers)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.cv(x)
         dtype = out.dtype
-        out = self.tr(out.float())
+        # TransformerEncoderLayer için veri tipini zorla eşitle
+        target_dtype = next(self.tr.parameters()).dtype
+        out = self.tr(out.to(target_dtype))
         return out.to(dtype)
 
 
@@ -282,46 +324,99 @@ def register():
         layers, save = [], []
         c2 = ch
 
-        from ultralytics.nn.modules.conv import (
-            Conv, DWConv, GhostConv, ConvTranspose, DWConvTranspose2d, Focus, Concat,
-        )
-        from ultralytics.nn.modules.block import (
-            C1, C2, C2f, C3, C3TR, C2PSA, C2fPSA, C2fCIB, C2fAttn,
-            C3Ghost, C3k2, C3x, RepC3, PSA, SCDown, SPPF, SPP, SPPELAN,
-            Bottleneck, BottleneckCSP, GhostBottleneck,
-            HGStem, HGBlock, ResNetLayer, ELAN1, ADown, AConv,
-            RepNCSPELAN4, RepVGGDW, A2C2f, CBLinear, CBFuse, Attention,
-        )
+        # ── Modül importları: sürüm-güvenli (try/except) ─────────────
+        from ultralytics.nn.modules.conv import Conv, DWConv, Concat
         try:
-            from ultralytics.nn.modules.block import ImagePoolingAttn, TorchVision, Index
-        except ImportError:
-            ImagePoolingAttn = TorchVision = Index = type(None)
-        from ultralytics.nn.modules.head import Detect, Classify
-        try:
-            from ultralytics.nn.modules.head import (
-                Segment, Pose, OBB, WorldDetect, YOLOEDetect,
-                YOLOESegment, v10Detect, RTDETRDecoder,
+            from ultralytics.nn.modules.conv import (
+                GhostConv, ConvTranspose, DWConvTranspose2d, Focus,
             )
         except ImportError:
-            pass
-        try:
-            from ultralytics.nn.modules.head import Segment26, Pose26, OBB26, YOLOESegment26
-        except ImportError:
-            Segment26 = Pose26 = OBB26 = YOLOESegment26 = type(None)
-        from ultralytics.nn.modules.transformer import AIFI
+            GhostConv = ConvTranspose = DWConvTranspose2d = Focus = type(None)
 
-        base_modules = frozenset({
-            Classify, Conv, ConvTranspose, GhostConv, Bottleneck, GhostBottleneck,
-            SPP, SPPF, C2fPSA, C2PSA, DWConv, Focus, BottleneckCSP,
-            C1, C2, C2f, C3k2, RepNCSPELAN4, ELAN1, ADown, AConv, SPPELAN,
-            C2fAttn, C3, C3TR, C3Ghost, DWConvTranspose2d, C3x, RepC3,
-            PSA, SCDown, C2fCIB, A2C2f,
+        from ultralytics.nn.modules.block import (
+            C1, C2, C2f, C3, SPPF, SPP, Bottleneck, BottleneckCSP,
+        )
+        # Opsiyonel bloklar — sürüme göre değişir
+        _opt_blocks = {
+            "C2PSA": type(None), "C2fPSA": type(None), "C2fCIB": type(None),
+            "C2fAttn": type(None), "C3TR": type(None), "C3Ghost": type(None),
+            "C3k2": type(None), "C3x": type(None), "RepC3": type(None),
+            "PSA": type(None), "SCDown": type(None), "SPPELAN": type(None),
+            "GhostBottleneck": type(None), "HGStem": type(None),
+            "HGBlock": type(None), "ResNetLayer": type(None),
+            "ELAN1": type(None), "ADown": type(None), "AConv": type(None),
+            "RepNCSPELAN4": type(None), "RepVGGDW": type(None),
+            "A2C2f": type(None), "CBLinear": type(None), "CBFuse": type(None),
+            "Attention": type(None), "Classify": type(None),
+            "ImagePoolingAttn": type(None), "TorchVision": type(None), "Index": type(None),
+        }
+        import ultralytics.nn.modules.block as _blk
+        for _n, _default in _opt_blocks.items():
+            _opt_blocks[_n] = getattr(_blk, _n, _default)
+        # NOT: locals().update() Python'da çalışmaz — explicit atamalar kullanıyoruz
+
+        # Kısa referanslar için
+        C2PSA = _opt_blocks["C2PSA"]; C2fPSA = _opt_blocks["C2fPSA"]
+        C2fCIB = _opt_blocks["C2fCIB"]; C2fAttn = _opt_blocks["C2fAttn"]
+        C3TR = _opt_blocks["C3TR"]; C3Ghost = _opt_blocks["C3Ghost"]
+        C3k2 = _opt_blocks["C3k2"]; C3x = _opt_blocks["C3x"]
+        RepC3 = _opt_blocks["RepC3"]; PSA = _opt_blocks["PSA"]
+        SCDown = _opt_blocks["SCDown"]; SPPELAN = _opt_blocks["SPPELAN"]
+        GhostBottleneck = _opt_blocks["GhostBottleneck"]
+        HGStem = _opt_blocks["HGStem"]; HGBlock = _opt_blocks["HGBlock"]
+        ResNetLayer = _opt_blocks["ResNetLayer"]
+        ELAN1 = _opt_blocks["ELAN1"]; ADown = _opt_blocks["ADown"]
+        AConv = _opt_blocks["AConv"]; RepNCSPELAN4 = _opt_blocks["RepNCSPELAN4"]
+        RepVGGDW = _opt_blocks["RepVGGDW"]; A2C2f = _opt_blocks["A2C2f"]
+        CBLinear = _opt_blocks["CBLinear"]; CBFuse = _opt_blocks["CBFuse"]
+        Attention = _opt_blocks["Attention"]; Classify = _opt_blocks["Classify"]
+
+        from ultralytics.nn.modules.head import Detect
+        _opt_heads = {
+            "Segment": type(None), "Pose": type(None), "OBB": type(None),
+            "WorldDetect": type(None), "YOLOEDetect": type(None),
+            "YOLOESegment": type(None), "v10Detect": type(None),
+            "RTDETRDecoder": type(None), "Segment26": type(None),
+            "Pose26": type(None), "OBB26": type(None), "YOLOESegment26": type(None),
+        }
+        import ultralytics.nn.modules.head as _head
+        for _n, _default in _opt_heads.items():
+            _opt_heads[_n] = getattr(_head, _n, _default)
+        Segment = _opt_heads["Segment"]; Pose = _opt_heads["Pose"]
+        OBB = _opt_heads["OBB"]; WorldDetect = _opt_heads["WorldDetect"]
+        YOLOEDetect = _opt_heads["YOLOEDetect"]; YOLOESegment = _opt_heads["YOLOESegment"]
+        v10Detect = _opt_heads["v10Detect"]; RTDETRDecoder = _opt_heads["RTDETRDecoder"]
+        Segment26 = _opt_heads["Segment26"]; Pose26 = _opt_heads["Pose26"]
+        OBB26 = _opt_heads["OBB26"]; YOLOESegment26 = _opt_heads["YOLOESegment26"]
+
+        try:
+            from ultralytics.nn.modules.transformer import AIFI
+        except ImportError:
+            AIFI = type(None)
+
+        # ── base_modules: kanal hesabı gerektiren modüller ──────────
+        # type(None) stub'larını filtrele — boş sınıflar frozenset'e giremez
+        _base = {
+            Conv, DWConv, Bottleneck, BottleneckCSP, SPP, SPPF, C1, C2, C2f,
             SwinC2f, DSConv, LEM, DilatedConv,
-        })
-        repeat_modules = frozenset({
-            BottleneckCSP, C1, C2, C2f, C3k2, C2fAttn, C3, C3TR,
-            C3Ghost, C3x, RepC3, C2fPSA, C2fCIB, C2PSA, A2C2f,
-        })
+        }
+        for _cls in (
+            GhostConv, ConvTranspose, GhostBottleneck, Focus, DWConvTranspose2d,
+            C2PSA, C2fPSA, C2fCIB, C2fAttn, C3, C3TR, C3Ghost, C3k2, C3x,
+            RepC3, PSA, SCDown, SPPELAN, ELAN1, ADown, AConv,
+            RepNCSPELAN4, A2C2f, Classify,
+        ):
+            if _cls is not type(None):
+                _base.add(_cls)
+        base_modules = frozenset(_base)
+
+        _rep = {C1, C2, C2f, C3, BottleneckCSP}
+        for _cls in (C2fAttn, C3TR, C3Ghost, C3k2, C3x, RepC3, C2fPSA, C2fCIB, C2PSA, A2C2f):
+            if _cls is not type(None):
+                _rep.add(_cls)
+        repeat_modules = frozenset(_rep)
+
+
 
         if verbose:
             from ultralytics.utils import LOGGER
@@ -358,14 +453,16 @@ def register():
                     n = 1
             elif m is AIFI:
                 args = [ch_list[f], *args]
-            elif m in frozenset({HGStem, HGBlock}):
+            elif HGStem is not type(None) and m is HGStem:
                 c1_val, cm, c2 = ch_list[f], args[0], args[1]
                 args = [c1_val, cm, c2, *args[2:]]
-                if m is HGBlock:
-                    args.insert(4, n)
-                    n = 1
-            elif m is ResNetLayer:
-                c2 = args[1] if args[3] else args[1] * 4
+            elif HGBlock is not type(None) and m is HGBlock:
+                c1_val, cm, c2 = ch_list[f], args[0], args[1]
+                args = [c1_val, cm, c2, *args[2:]]
+                args.insert(4, n)
+                n = 1
+            elif ResNetLayer is not type(None) and m is ResNetLayer:
+                c2 = args[1] if len(args) > 3 and args[3] else args[1] * 4
             elif m is torch.nn.BatchNorm2d:
                 args = [ch_list[f]]
             elif m is Concat:
@@ -407,9 +504,14 @@ def register():
                         detect_classes.add(cls)
 
                 if m in detect_classes:
-                    reg_max = d.get("reg_max", 16)
-                    end2end = d.get("end2end")
-                    args.extend([reg_max, end2end, [ch_list[x] for x in f]])
+                    # Bu ultralytics surumunde Detect imzasi:
+                    #   Detect(nc, reg_max=16, end2end=False, ch=())
+                    # args simdi [nc] icerecek (YAML'dan string "nc" -> int 8)
+                    _reg_max = d.get("reg_max", 16)
+                    _end2end = bool(d.get("end2end", False))
+                    ch_for_detect = tuple(ch_list[x] for x in f)
+                    args.extend([_reg_max, _end2end, ch_for_detect])
+
                 elif isinstance(f, int):
                     c2 = ch_list[f]
                 elif isinstance(f, list):
@@ -436,8 +538,23 @@ def register():
                 ch_list = []
             ch_list.append(c2)
 
+        # ── Detect head'ine reg_max / end2end set et ────────────────
+        # Ultralytics'in DetectionModel'i bunu build sonrası zaten yapıyor,
+        # ancak kendi parser'ımızda da güvence altına alıyoruz.
+        _reg_max_final = d.get("reg_max", 16)
+        _end2end_final = d.get("end2end", False)
+        if layers:
+            last = layers[-1]
+            if hasattr(last, "reg_max"):
+                last.reg_max = _reg_max_final
+            if hasattr(last, "end2end"):
+                last.end2end = bool(_end2end_final)
+
         return torch.nn.Sequential(*layers), sorted(save)
 
     tasks_mod.parse_model = _patched_parse_model
     _mod_names = ", ".join(_CUSTOM_MODULES.keys())
-    print(f"✅ SiHA custom modüller yüklendi: {_mod_names}")
+    try:
+        print(f"[OK] SiHA custom moduller yuklendi: {_mod_names}", flush=True)
+    except (ValueError, OSError):
+        pass  # stdout kapali/redirect - sorun degil, moduller yuklendi

@@ -28,6 +28,12 @@ from datetime import datetime
 
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
+# Custom modülleri yükle — SİHA-YOLO .pt dosyalarını açmak için şart
+try:
+    from siha_yolo.custom_modules import register as _register_custom_modules
+    _register_custom_modules()
+except Exception as _e:
+    print(f"⚠️  Custom modüller yüklenemedi: {_e}")
 
 # Desteklenen formatlar ve açıklamaları
 EXPORT_FORMATS = {

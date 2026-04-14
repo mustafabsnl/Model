@@ -59,16 +59,17 @@ GPU_PROFILES = {
     # 🔸 İKİNCİ BİLGİSAYAR — Masaüstü (i7-12700K + RTX 3070 Ti)
     # ══════════════════════════════════════════════════════════════════
     "3070ti_desktop": GPUProfile(
-        name="RTX 3070 Ti Desktop (8GB VRAM) + i7-12700K",
+        name="RTX 3070 Ti Desktop (8GB VRAM) + i7-12700K (64GB RAM)",
         vram_gb=8,
-        batch_640=12,              # 8GB VRAM ile rahat 12 batch
-        batch_1280=4,              # 1280'de 4 batch
-        workers=8,                 # i7-12700K = 12C/20T, 8 worker ideal
+        batch_640=16,              # AMP + 8GB VRAM ile 16 batch kaldırır (OOM alırsan 12'ye dön)
+        batch_1280=4,              # 1280'de 4 batch güvenli
+        workers=4,                 # Windows'ta 4 worker daha kararli (8 fazla spawn overhead yaratiyor)
         max_imgsz=1280,
-        amp=True,
-        cache="ram",               # 8GB VRAM + güçlü CPU = RAM cache OK
-        notes="🖥️ İkinci bilgisayar. 2x VRAM avantajı sayesinde daha büyük batch "
-              "ve daha hızlı eğitim. i7-12700K ile worker sayısı yüksek tutulabilir.",
+        amp=True,                  # Mixed precision şart — AMP olmadan batch 8'e düşür
+        cache="disk",              # 55K görüntü için 94GB RAM gerekiyor ama 63.8GB mevcut → disk cache
+        notes="Masaüstü PC. 55K görüntü icin 94GB RAM gerekiyor ama sadece 63.8GB mevcut. "
+              "disk cache kullaniliyor: RAM'den yavas ama cache'siz calisimaktan hizli. "
+              "OOM alirsan batch=12 dene. 8 worker Windows multiprocessing icin optimize.",
     ),
 
     # ══════════════════════════════════════════════════════════════════

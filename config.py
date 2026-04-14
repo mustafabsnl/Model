@@ -67,8 +67,8 @@ class TrainingConfig:
     device: str = "0"              # CUDA cihaz: "0", "0,1", veya "cpu"
     
     # ── Model ────────────────────────────────────────────────────────
-    model: str = "yolov8m.pt"      # Model yolu: .pt (weights) veya .yaml (mimari)
-    weights: str = ""             # Eğer model .yaml ise yüklenecek pretrained .pt (opsiyonel)
+    model: str = "siha_yolo/siha_yolov8_p2.yaml"  # SİHA-YOLO özel mimari
+    weights: str = "yolov8m.pt"   # Pretrained ağırlıklar (.yaml modeli için)
     pretrained: bool = True        # Önceden eğitilmiş ağırlıklar kullan
     
     # ── Veri Seti ────────────────────────────────────────────────────
@@ -116,6 +116,7 @@ class TrainingConfig:
     erasing: float = 0.4           # Random erasing
     altitude_aug: float = 0.3      # İrtifa simülasyonu olasılığı (downscale+upscale)
     motion_blur_aug: float = 0.2   # Motion blur olasılığı
+    focal_eiou_gamma: float = 0.5  # Focal-EIoU gamma (0=standart EIoU, 0.5=önerilen)
     
     # ── Kayıt ve Çıktı ───────────────────────────────────────────────
     project: str = ""              # Çıktı proje dizini
@@ -157,7 +158,7 @@ def create_config(
         Ayarlanmış TrainingConfig nesnesi
     
     Örnek:
-        cfg = create_config("3060_laptop", epochs=500, model="yolov8l.pt")
+        cfg = create_config("3060_laptop", epochs=500)
     """
     config = TrainingConfig()
     
@@ -314,7 +315,7 @@ def print_config(config: TrainingConfig):
         "🔄 Augmentation": ["hsv_h", "hsv_s", "hsv_v", "degrees", "translate",
                             "scale", "fliplr", "flipud", "mosaic", "mixup",
                             "close_mosaic", "erasing",
-                            "altitude_aug", "motion_blur_aug"],
+                            "altitude_aug", "motion_blur_aug", "focal_eiou_gamma"],
         "📁 Çıktı": ["project", "name", "plots", "save", "val"],
     }
     
@@ -344,5 +345,5 @@ if __name__ == "__main__":
     
     # Belirli profil ile config
     print("\n\n--- 5090 Desktop profili ile ---")
-    cfg_5090 = create_config("5090_desktop", epochs=500, imgsz=1280, model="yolov8l.pt")
+    cfg_5090 = create_config("5090_desktop", epochs=500, imgsz=1280)
     print_config(cfg_5090)

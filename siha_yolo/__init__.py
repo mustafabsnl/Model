@@ -6,9 +6,12 @@ Makalelere dayalı modifikasyonlar:
   - P2 Head (4. tespit kafası, küçük nesne tespiti)
   - SimAM (parametresiz dikkat mekanizması)
   - Focal-EIoU (küçük nesne regresyon kaybı)
-  - BiFPN, Swin-C2f, DSConv (sonraki fazlarda)
+  - BiFPN, Swin-C2f, DSConv, LEM, DilatedConv, CSSF, FFM, ASFF
 """
 
 __version__ = "1.0.0"
 
-from siha_yolo.siha_model import SihaYolo
+# Bu paketin eğitim altyapısında yalnızca custom_modules.py kullanılır.
+# Dışarıdan kullanım için register() fonksiyonunu import et:
+#   from siha_yolo.custom_modules import register
+#   register()

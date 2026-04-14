@@ -1,21 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-YOLO Model Eğitim Scripti
+SİHA-YOLO Eğitim Scripti
 ==========================
+Özel SİHA-YOLO mimarisi (P2 Head + SimAM + BiFPN + ASFF) ile eğitim.
 GPU profiline göre otomatik ayarlanan, resume destekli, kapsamlı eğitim scripti.
 
 Kullanım:
-    # Temel kullanım (GPU otomatik algılanır)
-    python train.py --data C:/datasets/siha/data.yaml --model yolov8m.pt
+    # Temel kullanım — SİHA-YOLO mimarisi (varsayılan)
+    python train.py --data C:/datasets/siha/data.yaml
 
     # Belirli GPU profili ile
-    python train.py --data data.yaml --gpu 3060_laptop --model yolov8m.pt
+    python train.py --data data.yaml --gpu 3070ti_desktop
 
-    # Güçlü GPU ile büyük eğitim
-    python train.py --data data.yaml --gpu 5090_desktop --model yolov8l.pt --epochs 500 --imgsz 1280
+    # Pretrained weights ile
+    python train.py --data data.yaml --weights yolov8m.pt
 
     # Kaldığı yerden devam
-    python train.py --resume --resume-path runs/siha_detection/yolov8m_640_.../weights/last.pt
+    python train.py --resume --resume-path runs/siha_detection/.../weights/last.pt
 
     # Kayıtlı config dosyasından yükle
     python train.py --load-config runs/siha_detection/.../config.json
@@ -27,19 +28,32 @@ Kullanım:
 import argparse
 import csv
 import os
+import warnings
+
+# FutureWarning spam bastir - pynvml her worker surecinde torch.cuda import edilince cikiyor
+# PYTHONWARNINGS env degiskeni worker sureclerine miras kalir -> tum surecler etkiliyor
+os.environ.setdefault("PYTHONWARNINGS", "ignore::FutureWarning")
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 import shutil
 import sys
 import time
 import signal
 import json
-import io
 from pathlib import Path
 from datetime import datetime
 
-# Windows terminal encoding fix
+# Windows terminal encoding fix (stream kapatmadan, sadece encoding ayarla)
 if sys.platform == 'win32':
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+    import os
+    os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
+    try:
+        if hasattr(sys.stdout, 'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        if hasattr(sys.stderr, 'reconfigure'):
+            sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass  # Encoding ayarlanamadiysa devam et
 
 # Bu dosyanın bulunduğu dizini Python path'e ekle
 sys.path.insert(0, str(Path(__file__).parent.resolve()))
@@ -50,15 +64,16 @@ _LOCAL_ULTRALYTICS_ROOT = Path(__file__).parent / "ultralytics"
 if _LOCAL_ULTRALYTICS_ROOT.exists():
     sys.path.insert(0, str(_LOCAL_ULTRALYTICS_ROOT.resolve()))
 
-# Custom modülleri (SimAM, BiFPN, SwinC2f, DSConv) ultralytics'e tanıt
-from siha_yolo.custom_modules import register as _register_custom_modules
-_register_custom_modules()
-
+# config ve gpu_config modülleri — worker'larda da import edilebilir (sadece sınıf tanımları)
 from config import (
     TrainingConfig, create_config, config_to_train_args,
     save_config, load_config, print_config
 )
 from gpu_config import list_profiles, detect_gpu, GPU_PROFILES
+
+# Custom modüllerin register() fonksiyonunu import et (çağırma! — main() içinde çağrılacak)
+# Bu sayede DataLoader worker'ları register()'ı çalıştırmaz → [OK] spam'i durur
+from siha_yolo.custom_modules import register as _register_custom_modules
 
 
 # ============================================================================
@@ -81,8 +96,8 @@ def print_banner():
     """Baslangic banneri yazdirir."""
     print("")
     print("=" * 60)
-    print("    TEKNOFEST SiHA - YOLO Egitim Sistemi")
-    print("    Yerel PC Egitim Altyapisi v1.0")
+    print("    TEKNOFEST SiHA-YOLO Egitim Sistemi")
+    print("    Ozel Mimari: P2 Head + SimAM + BiFPN + ASFF")
     print("=" * 60)
     print("")
 
@@ -130,41 +145,22 @@ def validate_data_path(data_path: str) -> str:
 
 
 def validate_model_path(model_path: str) -> str:
-    """Model yolunu doğrular. Standart YOLO modellerini otomatik indirir.
+    """Model yolunu doğrular.
 
-    Not: .yaml/.yml bir mimari dosyası olabilir; bu durumda sadece varlık kontrolü yapılır.
+    .yaml/.yml mimari dosyalarını ve .pt ağırlık dosyalarını destekler.
+    Eğer relative path verilmişse script dizinine göre çözümlenir.
     """
-    standard_models = [
-        "yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt",
-        "yolov8n6.pt", "yolov8s6.pt", "yolov8m6.pt", "yolov8l6.pt", "yolov8x6.pt",
-    ]
-    
-    # Model cfg (YAML) yolu
-    if model_path.lower().endswith((".yaml", ".yml")):
-        model_path = str(Path(model_path).resolve())
-        if not os.path.exists(model_path):
-            print(f"❌ Model mimari dosyası bulunamadı: {model_path}")
-            sys.exit(1)
-        return model_path
+    # Relative path ise script dizinine göre çözümle
+    p = Path(model_path)
+    if not p.is_absolute():
+        p = Path(__file__).parent / p
+    model_path = str(p.resolve())
 
-    if model_path in standard_models:
-        # Standart model: Ultralytics otomatik indirecek
-        weights_dir = Path(__file__).parent / "weights"
-        weights_dir.mkdir(parents=True, exist_ok=True)
-        local_path = weights_dir / model_path
-        if local_path.exists():
-            print(f"✅ Model bulundu: {local_path}")
-            return str(local_path)
-        else:
-            print(f"📥 Model ilk çalıştırmada indirilecek: {model_path}")
-            return model_path
-    
-    # Özel model yolu
-    model_path = str(Path(model_path).resolve())
     if not os.path.exists(model_path):
         print(f"❌ Model dosyası bulunamadı: {model_path}")
+        print(f"   Beklenen: SİHA-YOLO YAML veya .pt dosyası")
         sys.exit(1)
-    
+
     return model_path
 
 
@@ -173,15 +169,16 @@ def validate_weights_path(weights_path: str) -> str:
     if not weights_path:
         return ""
 
-    standard_weights = [
-        "yolov8n.pt", "yolov8s.pt", "yolov8m.pt", "yolov8l.pt", "yolov8x.pt",
-        "yolov8n6.pt", "yolov8s6.pt", "yolov8m6.pt", "yolov8l6.pt", "yolov8x6.pt",
-    ]
-
-    basename = Path(weights_path).name
-    if basename in standard_weights:
-        print(f"📥 Pretrained weights Ultralytics tarafından indirilecek: {basename}")
-        return basename
+    # Relative path ise script dizinine göre çözümle
+    p = Path(weights_path)
+    if not p.is_absolute():
+        local = Path(__file__).parent / p
+        if local.exists():
+            weights_path = str(local.resolve())
+        else:
+            # Ultralytics standart model adı olabilir (yolov8m.pt vb.) — olduğu gibi bırak
+            print(f"📥 Pretrained weights: {weights_path}")
+            return weights_path
 
     weights_path = str(Path(weights_path).resolve())
     if not os.path.exists(weights_path):
@@ -277,8 +274,27 @@ def _generate_training_plots(results_csv: Path, out_dir: Path):
         plt.close()
 
 
-def _make_snapshot_callback(period: int, save_dir: Path):
-    """Her *period* epoch'ta tam bir snapshot oluşturan Ultralytics callback'i döner."""
+def _make_snapshot_callbacks(period: int, save_dir: Path):
+    """Her *period* epoch'ta tam bir snapshot oluşturan callback çifti döner.
+
+    Returns:
+        (on_train_start_cb, on_fit_epoch_end_cb) — iki callback fonksiyonu.
+        on_train_start_cb: validator'a plots hook'u ekler.
+        on_fit_epoch_end_cb: asıl snapshot işlemini yapar.
+    """
+
+    def _on_train_start(trainer):
+        """Validator'a on_val_start hook'u ekle: snapshot epoch'larında plots=True zorla."""
+        v = getattr(trainer, "validator", None)
+        if v is None:
+            return
+
+        def _force_plots_for_snapshot(validator):
+            epoch = trainer.epoch + 1
+            if epoch % period == 0:
+                validator.args.plots = True
+
+        v.add_callback("on_val_start", _force_plots_for_snapshot)
 
     def _on_fit_epoch_end(trainer):
         epoch = trainer.epoch + 1  # 0-indexed → 1-indexed
@@ -288,7 +304,7 @@ def _make_snapshot_callback(period: int, save_dir: Path):
         snap_dir = save_dir / f"snapshot_epoch_{epoch}"
         snap_dir.mkdir(parents=True, exist_ok=True)
 
-        # Weights kopyala
+        # ── 1. Weights kopyala ──
         snap_weights = snap_dir / "weights"
         snap_weights.mkdir(exist_ok=True)
         src_weights = save_dir / "weights"
@@ -297,20 +313,47 @@ def _make_snapshot_callback(period: int, save_dir: Path):
             if src.exists():
                 shutil.copy2(str(src), str(snap_weights / name))
 
-        # results.csv, args.yaml kopyala
-        for fname in ("results.csv", "args.yaml", "training_config.json"):
-            src = save_dir / fname
-            if src.exists():
-                shutil.copy2(str(src), str(snap_dir / fname))
+        # ── 2. Mevcut tüm dosyaları kopyala (png, jpg, csv, yaml, json) ──
+        for pattern in ("*.png", "*.jpg", "*.csv", "*.yaml", "*.json"):
+            for src_file in save_dir.glob(pattern):
+                if src_file.is_file():
+                    shutil.copy2(str(src_file), str(snap_dir / src_file.name))
 
-        # Grafikleri oluştur
-        csv_path = snap_dir / "results.csv"
+        # ── 3. results.png'yi Ultralytics ile oluştur ──
         try:
-            _generate_training_plots(csv_path, snap_dir)
+            from ultralytics.utils.plotting import plot_results as _ul_plot_results
+            _ul_plot_results(file=snap_dir / "results.csv", dir=snap_dir, on_plot=None)
+        except Exception:
+            pass
+
+        # ── 4. Confusion Matrix oluştur ──
+        try:
+            v = trainer.validator
+            if v and hasattr(v, "confusion_matrix") and v.confusion_matrix is not None:
+                v.confusion_matrix.plot(
+                    save_dir=snap_dir, normalize=False, on_plot=None,
+                )
+                v.confusion_matrix.plot(
+                    save_dir=snap_dir, normalize=True, on_plot=None,
+                )
+        except Exception as exc:
+            print(f"  ⚠️  Confusion matrix hatası (epoch {epoch}): {exc}")
+
+        # ── 5. F1 / P / R / PR eğrileri oluştur ──
+        try:
+            v = trainer.validator
+            if v and hasattr(v, "metrics"):
+                _generate_val_curves(v.metrics, snap_dir, trainer.data)
+        except Exception as exc:
+            print(f"  ⚠️  Curve grafik hatası (epoch {epoch}): {exc}")
+
+        # ── 6. Kendi eğitim grafikleri (loss, metric, LR) ──
+        try:
+            _generate_training_plots(snap_dir / "results.csv", snap_dir)
         except Exception as exc:
             print(f"  ⚠️  Snapshot grafik hatası (epoch {epoch}): {exc}")
 
-        # Metrik özeti kaydet
+        # ── 7. Metrik özeti kaydet ──
         metrics = {}
         if hasattr(trainer, "metrics") and trainer.metrics:
             metrics = {
@@ -328,7 +371,137 @@ def _make_snapshot_callback(period: int, save_dir: Path):
 
         print(f"\n📸 Snapshot kaydedildi: {snap_dir}")
 
-    return _on_fit_epoch_end
+    return _on_train_start, _on_fit_epoch_end
+
+
+def _generate_val_curves(metrics, snap_dir: Path, data: dict):
+    """Validator metrics'ten BoxF1, BoxP, BoxPR, BoxR eğrilerini üretir."""
+    try:
+        from ultralytics.utils.metrics import plot_pr_curve, plot_mc_curve
+    except ImportError:
+        return
+
+    names = data.get("names", {})
+    box = getattr(metrics, "box", None)
+    if box is None:
+        return
+
+    px = getattr(box, "px", None)
+    if px is None or not hasattr(px, "__len__") or len(px) == 0:
+        return
+
+    prec_values = getattr(box, "prec_values", None)
+    f1_curve = getattr(box, "f1_curve", None)
+    p_curve = getattr(box, "p_curve", None)
+    r_curve = getattr(box, "r_curve", None)
+    all_ap = getattr(box, "all_ap", None)
+    ap50 = all_ap[:, 0] if all_ap is not None and hasattr(all_ap, "ndim") and all_ap.ndim >= 2 else None
+
+    if prec_values is not None:
+        try:
+            plot_pr_curve(px, prec_values, ap50,
+                          save_dir=snap_dir / "BoxPR_curve.png",
+                          names=names, on_plot=None)
+        except Exception:
+            pass
+
+    for arr, fname, ylabel in [
+        (f1_curve, "BoxF1_curve.png", "F1"),
+        (p_curve, "BoxP_curve.png", "Precision"),
+        (r_curve, "BoxR_curve.png", "Recall"),
+    ]:
+        if arr is not None:
+            try:
+                plot_mc_curve(px, arr, save_dir=snap_dir / fname,
+                              names=names, ylabel=ylabel, on_plot=None)
+            except Exception:
+                pass
+
+
+# ============================================================================
+# Focal-EIoU Loss Callback
+# ============================================================================
+
+def _make_focal_eiou_callback(gamma: float = 0.5):
+    """
+    on_train_start callback'i: Ultralytics loss hesaplayıcısındaki bbox_iou
+    çağrısını Focal-EIoU ile değiştiren monkey-patch.
+
+    Neden monkey-patch?
+      Ultralytics'in BboxLoss.forward() içindeki iou hesabı doğrudan
+      utils.metrics.bbox_iou'ya bağlı. Biz bu fonksiyonu geçici olarak
+      Focal-EIoU hesabı yapan bir wrapper ile değiştiriyoruz.
+      Bu sayede Ultralytics kaynak koduna dokunmadan entegrasyon sağlanır.
+
+    Args:
+        gamma: Focal üssü. 0.5 küçük nesneler için iyi denge noktası.
+    """
+    import torch
+
+    def _on_train_start(trainer):
+        try:
+            import ultralytics.utils.metrics as _metrics_mod
+            from siha_yolo.modules.focal_eiou import FocalEIoULoss
+
+            _focal_loss_fn = FocalEIoULoss(gamma=gamma, reduction="none")
+            _orig_bbox_iou = _metrics_mod.bbox_iou
+
+            def _focal_eiou_bbox_iou(box1, box2, xywh=True, GIoU=False,
+                                     DIoU=False, CIoU=False, eps=1e-7):
+                """
+                Ultralytics bbox_iou imzasını koruyarak Focal-EIoU döndürür.
+                Validation sırasında (grad kapalı) orijinal IoU'ya geri döner.
+                """
+                # Validation / NMS / metrik hesabında orijinal bbox_iou kullan
+                if not torch.is_grad_enabled():
+                    return _orig_bbox_iou(box1, box2, xywh=xywh,
+                                         GIoU=GIoU, DIoU=DIoU, CIoU=CIoU, eps=eps)
+
+                # xywh → xyxy dönüşümü
+                if xywh:
+                    x1 = box1[:, 0] - box1[:, 2] / 2
+                    y1 = box1[:, 1] - box1[:, 3] / 2
+                    x2 = box1[:, 0] + box1[:, 2] / 2
+                    y2 = box1[:, 1] + box1[:, 3] / 2
+                    pred_xyxy = torch.stack([x1, y1, x2, y2], dim=1)
+
+                    gx1 = box2[:, 0] - box2[:, 2] / 2
+                    gy1 = box2[:, 1] - box2[:, 3] / 2
+                    gx2 = box2[:, 0] + box2[:, 2] / 2
+                    gy2 = box2[:, 1] + box2[:, 3] / 2
+                    gt_xyxy = torch.stack([gx1, gy1, gx2, gy2], dim=1)
+                else:
+                    pred_xyxy = box1
+                    gt_xyxy  = box2
+
+                _focal_loss_fn.to(pred_xyxy.device)
+                focal_val = _focal_loss_fn(pred_xyxy.float(), gt_xyxy.float())
+                # BboxLoss içi: loss = (1 - iou) → biz iou = 1 - focal_val veriyoruz
+                iou_like = 1.0 - focal_val.clamp(0.0, 1.0)
+                return iou_like.to(box1.dtype)
+
+            # ── Patch uygula: hem metrics hem loss modülüne ──────────────
+            # Neden ikisi de?
+            #   BboxLoss (ultralytics/utils/loss.py) dosyanın üstünde şunu yapar:
+            #     from ultralytics.utils.metrics import bbox_iou
+            #   Bu Python'da yerel bir referans oluşturur. Sadece metrics modülünü
+            #   yamayarak bu yerel referansı değiştiremeyiz.
+            #   loss modülünü de yamalayarak ikisini de güvence altına alırız.
+            _metrics_mod.bbox_iou = _focal_eiou_bbox_iou
+
+            try:
+                import ultralytics.utils.loss as _loss_mod
+                if hasattr(_loss_mod, "bbox_iou"):
+                    _loss_mod.bbox_iou = _focal_eiou_bbox_iou
+            except Exception:
+                pass  # bazı sürümlerde loss.py bbox_iou'yu farklı yerde tutar
+
+            print(f"🎯 Focal-EIoU Loss aktif (gamma={gamma}) — standart iou yerine kullanılıyor.")
+
+        except Exception as exc:
+            print(f"⚠️  Focal-EIoU bağlanamadı, standart loss kullanılacak: {exc}")
+
+    return _on_train_start
 
 
 # ============================================================================
@@ -425,11 +598,14 @@ def run_training(config: TrainingConfig):
     # ── Snapshot callback ekle ────────────────────────────────────
     snap_period = config.save_period
     if snap_period and snap_period > 0:
-        model.add_callback(
-            "on_fit_epoch_end",
-            _make_snapshot_callback(snap_period, output_dir),
-        )
-        print(f"📸 Snapshot sistemi aktif: her {snap_period} epoch'ta tam kayıt")
+        snap_train_start, snap_epoch_end = _make_snapshot_callbacks(snap_period, output_dir)
+        model.add_callback("on_train_start", snap_train_start)
+        model.add_callback("on_fit_epoch_end", snap_epoch_end)
+        print(f"📸 Snapshot sistemi aktif: her {snap_period} epoch'ta tam kayıt (grafikler dahil)")
+
+    # ── SİHA-YOLO v2.0 Hybrid Loss aktif et ───────────────────────
+    from siha_yolo.modules.hybrid_loss import apply_hybrid_loss
+    model.add_callback("on_train_start", apply_hybrid_loss)
 
     # ── Altitude / Blur augmentation callback ekle ───────────────
     p_alt = getattr(config, "altitude_aug", 0.0)
@@ -543,18 +719,18 @@ def run_export(
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="🎯 TEKNOFEST SİHA - YOLOv8 Eğitim Scripti",
+        description="🎯 TEKNOFEST SİHA-YOLO Eğitim Scripti",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Kullanım Örnekleri:
-  # Temel eğitim (GPU otomatik)
-  python train.py --data C:/datasets/siha/data.yaml --model yolov8m.pt
+  # Temel eğitim — SİHA-YOLO mimarisi (varsayılan)
+  python train.py --data C:/datasets/siha/data.yaml
 
-  # 3060 Laptop ile eğitim
-  python train.py --data data.yaml --gpu 3060_laptop --epochs 300
+  # GPU profili belirterek
+  python train.py --data data.yaml --gpu 3070ti_desktop
 
-  # 5090 Desktop ile büyük eğitim
-  python train.py --data data.yaml --gpu 5090_desktop --model yolov8l.pt --epochs 500 --imgsz 1280
+  # Pretrained weights ile
+  python train.py --data data.yaml --weights yolov8m.pt
 
   # Kaldığı yerden devam
   python train.py --resume --resume-path runs/.../weights/last.pt --data data.yaml
@@ -573,8 +749,8 @@ GPU Profilleri:
     basic.add_argument(
         "--model",
         type=str,
-        default="yolov8s.pt",
-        help="Model yolu: .pt (weights) veya .yaml/.yml (mimari). Varsayılan: yolov8s.pt",
+        default="siha_yolo/siha_yolov8_p2.yaml",
+        help="Model mimari dosyası (.yaml) veya ağırlık (.pt). Varsayılan: SİHA-YOLO",
     )
     basic.add_argument(
         "--weights",
@@ -593,6 +769,8 @@ GPU Profilleri:
     training.add_argument("--patience", type=int, default=None, help="Early stopping patience")
     training.add_argument("--optimizer", type=str, default=None, choices=["SGD", "Adam", "AdamW", "auto"], help="Optimizer")
     training.add_argument("--lr0", type=float, default=None, help="Başlangıç learning rate")
+    training.add_argument("--lrf", type=float, default=None, help="Final learning rate oranı (lr0 * lrf)")
+    training.add_argument("--warmup-epochs", type=float, default=None, help="Warmup epoch sayısı")
     
     # Resume
     resume_grp = parser.add_argument_group("Devam Etme (Resume)")
@@ -643,8 +821,11 @@ GPU Profilleri:
 
 
 def main():
+    # Custom modülleri ANA SÜREÇTE kaydet (worker'larda çalışmaz)
+    _register_custom_modules()
+
     print_banner()
-    
+
     args = parse_args()
     
     # GPU listesi
@@ -673,6 +854,8 @@ def main():
             "patience": args.patience,
             "optimizer": args.optimizer,
             "lr0": args.lr0,
+            "lrf": args.lrf,
+            "warmup_epochs": args.warmup_epochs,
             "save_period": args.save_period,
             "mosaic": args.mosaic,
             "mixup": args.mixup,
@@ -681,7 +864,7 @@ def main():
             "dropout": args.dropout,
             "cos_lr": args.cos_lr,
             "rect": True if args.rect else None,
-            "model": args.model if args.model != "yolov8s.pt" else None,
+            "model": args.model,
             "weights": args.weights,
         }
         
@@ -696,10 +879,8 @@ def main():
         config = create_config(gpu_profile=args.gpu, **overrides)
     
     # Model ayarla
-    if args.model and args.model != "yolov8s.pt":
+    if args.model:
         config.model = args.model
-    elif not config.model:
-        config.model = "yolov8s.pt"
     if args.weights is not None:
         config.weights = args.weights or ""
     
