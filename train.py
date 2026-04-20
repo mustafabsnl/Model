@@ -649,7 +649,7 @@ try:
     if '{_abs_dir}' not in sys.path:
         sys.path.insert(0, '{_abs_dir}')
     from siha_yolo.custom_modules import register
-    register(verbose=False)
+    register()
 except Exception as e:
     print(f"\\n[!] SIHA DDP Yama Hatasi (Rank Sürecinde): {{e}}\\n")
 """
