@@ -624,7 +624,25 @@ def run_training(config: TrainingConfig):
     """
     import torch
     from ultralytics import YOLO
-    
+
+    # ── DDP (Çoklu GPU) İçin Ultralytics Kalıcı Patch ────────────
+    # Kaggle 2xT4 gibi sistemlerde DDP, train.py'yi atlayarak
+    # alt süreçler (Rank 1 vb.) başlatır. Bizim custom modüller
+    # o süreçlerde yok hükmündedir (KeyError: 'LEM').
+    # Bunu çözmek için ultralytics'in çekirdeğine kendimizi kaydediyoruz.
+    try:
+        import ultralytics.nn.tasks as _tasks
+        _tasks_file = _tasks.__file__
+        with open(_tasks_file, "r", encoding="utf-8") as f:
+            _content = f.read()
+        _patch_str = "\n# SIHA-YOLO DDP INJECTION\ntry:\n    import sys; sys.path.append('.')\n    from siha_yolo.custom_modules import register\n    register(verbose=False)\nexcept Exception:\n    pass\n"
+        if "# SIHA-YOLO DDP INJECTION" not in _content:
+            with open(_tasks_file, "a", encoding="utf-8") as f:
+                f.write(_patch_str)
+            print("\n💉 Ultralytics çekirdeğine DDP custom modül yaması uygulandı.")
+    except Exception as e:
+        print(f"\n⚠️ DDP patch uygulanamadı: {e}")
+
     # ── Bilgi Yazdır ─────────────────────────────────────────────
     print_config(config)
     
