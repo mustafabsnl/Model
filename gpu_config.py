@@ -31,6 +31,7 @@ class GPUProfile:
     amp: bool = True             # Mixed precision (AMP) aktif mi?
     cache: str = "ram"           # Veri önbellekleme: "ram", "disk", veya False
     notes: str = ""              # Kullanıcı için notlar
+    device: Optional[str] = None # Çoklu GPU: "0,1" — None ise TrainingConfig.device (varsayılan "0")
 
 
 # ============================================================================
@@ -133,6 +134,23 @@ GPU_PROFILES = {
         amp=True,
         cache="ram",
         notes="Blackwell mimarisi. Maksimum performans.",
+    ),
+
+    # ══════════════════════════════════════════════════════════════════
+    # ☁️ KAGGLE — 2× Tesla T4 (çoğu GPU Notebook)
+    # ══════════════════════════════════════════════════════════════════
+    "kaggle_2xt4": GPUProfile(
+        name="Kaggle — 2× Tesla T4 (~16 GB/GPU), DDP",
+        vram_gb=16,
+        batch_640=20,
+        batch_1280=6,
+        workers=4,
+        max_imgsz=1280,
+        amp=True,
+        cache=False,
+        notes="device=0,1 ile çift GPU DDP. Batch toplam boyutu (GPU’lara bölünür); OOM olursa --batch 12–16. "
+              "Çıktıyı /kaggle/working altına alın: --project /kaggle/working/runs",
+        device="0,1",
     ),
 }
 
@@ -259,6 +277,8 @@ def list_profiles():
         print(f"     Batch@640: {p.batch_640}  |  Batch@1280: {p.batch_1280}")
         print(f"     Workers  : {p.workers}  |  Max imgsz: {p.max_imgsz}")
         print(f"     AMP      : {'✅' if p.amp else '❌'}  |  Cache: {p.cache}")
+        if getattr(p, "device", None):
+            print(f"     device   : {p.device}")
         if p.notes:
             print(f"     Not      : {p.notes}")
 

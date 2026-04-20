@@ -74,7 +74,8 @@ def t_config():
     from config import TrainingConfig, config_to_train_args
     cfg = TrainingConfig()
     for f in ["model","data","epochs","imgsz","batch",
-              "altitude_aug","motion_blur_aug","focal_eiou_gamma","save_period","weights"]:
+              "distance_sim_aug","motion_blur_aug","focal_eiou_gamma","loss_mode",
+              "save_period","snapshot_period","weights"]:
         assert hasattr(cfg, f), f"Config: '{f}' eksik!"
     args = config_to_train_args(cfg)
     assert isinstance(args, dict)
@@ -236,7 +237,7 @@ def t_yaml_parse():
     register()
     import ultralytics.nn.tasks as tasks_mod
 
-    with open(os.path.join(BASE,"siha_yolo","siha_yolov8_p2.yaml"), encoding="utf-8") as f:
+    with open(os.path.join(BASE,"siha_yolo","siha_yolov8_v4.yaml"), encoding="utf-8") as f:
         d = yaml.safe_load(f)
 
     model_seq, save = tasks_mod.parse_model(d, ch=3, verbose=False)
@@ -253,7 +254,7 @@ def t_detect_head():
     import ultralytics.nn.tasks as tasks_mod
     from ultralytics.nn.modules.head import Detect
 
-    with open(os.path.join(BASE,"siha_yolo","siha_yolov8_p2.yaml"), encoding="utf-8") as f:
+    with open(os.path.join(BASE,"siha_yolo","siha_yolov8_v4.yaml"), encoding="utf-8") as f:
         d = yaml.safe_load(f)
 
     model_seq, _ = tasks_mod.parse_model(d, ch=3, verbose=False)
@@ -301,7 +302,7 @@ def t_gpu_yaml():
     register()
     import ultralytics.nn.tasks as tasks_mod
 
-    with open(os.path.join(BASE,"siha_yolo","siha_yolov8_p2.yaml"), encoding="utf-8") as f:
+    with open(os.path.join(BASE,"siha_yolo","siha_yolov8_v4.yaml"), encoding="utf-8") as f:
         d = yaml.safe_load(f)
 
     model_seq, _ = tasks_mod.parse_model(d, ch=3, verbose=False)
@@ -341,7 +342,7 @@ if failed == 0:
     print("\n  ALL TESTS PASSED - Ready for training!\n")
     print("  Run command:")
     print("  python train.py --data \"C:\\Users\\musta\\Downloads\\archive\\Dataset\\data.yaml\"")
-    print("                  --gpu 3070ti_desktop --model siha_yolo/siha_yolov8_p2.yaml\n")
+    print("                  --gpu 3070ti_desktop --model siha_yolo/siha_yolov8_v4.yaml\n")
 else:
     print("\n  FAILED TESTS:")
     for ok, name in results:

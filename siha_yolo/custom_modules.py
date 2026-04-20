@@ -309,6 +309,23 @@ def register():
         import ast, contextlib
 
         nc = d.get("nc", 80)
+
+        # ── nc güvenlik logu ──────────────────────────────────────────
+        # YAML nc değeri Detect head kanallarını belirler.
+        # data.yaml nc ile ve config.nc ile tutarlı olmalı.
+        if verbose:
+            try:
+                from ultralytics.utils import LOGGER
+                if nc != 1:
+                    LOGGER.warning(
+                        f"[SiHA-parse] UYARI: YAML nc={nc} — tek sınıf UAV eğitimi için "
+                        f"'nc: 1' bekleniyor! siha_yolov8_v4.yaml kontrol edin."
+                    )
+                else:
+                    LOGGER.info(f"[SiHA-parse] nc={nc} ✔  (tek sınıf UAV)")
+            except Exception:
+                pass  # import hatası ignore
+
         scales = d.get("scales")
         scale = d.get("scale")
         if scales:
@@ -472,20 +489,65 @@ def register():
             elif m is SimAM:
                 c2 = ch_list[f]
             elif m is CSSF:
+                # CSSF(c_low, c_high, c_out) — P5→P2 skip füzyon
+                # f[0]: derin ölçek (P5/SPPF), f[1]: sığ ölçek (P2)
                 c_low = ch_list[f[0]]
                 c_high = ch_list[f[1]]
-                c2 = c_high
+                c2 = c_high  # çıkış kanalı = sığ ölçek kanalı
+                if c_low <= 0 or c_high <= 0:
+                    raise ValueError(
+                        f"[SiHA-parse] CSSF (layer {i}): geçersiz kanal! "
+                        f"c_low={c_low} (from layer {f[0]}), "
+                        f"c_high={c_high} (from layer {f[1]}). "
+                        f"ch_list boyutu={len(ch_list)}"
+                    )
                 args = [c_low, c_high, c2]
+                if verbose:
+                    LOGGER.info(
+                        f"    [CSSF] layer {i}: c_low={c_low} (idx {f[0]}), "
+                        f"c_high={c_high} (idx {f[1]}), c_out={c2}"
+                    )
             elif m is FFM:
+                # FFM(c_shallow, c_deep, c_out) — shallow backbone + deep neck concat
+                # f[0]: deep (neck çıktısı), f[1]: shallow (backbone)
                 c_deep = ch_list[f[0]]
                 c_shallow = ch_list[f[1]]
-                c2 = c_deep
+                c2 = c_deep  # çıkış kanalı = deep kanal
+                if c_deep <= 0 or c_shallow <= 0:
+                    raise ValueError(
+                        f"[SiHA-parse] FFM (layer {i}): geçersiz kanal! "
+                        f"c_deep={c_deep} (from layer {f[0]}), "
+                        f"c_shallow={c_shallow} (from layer {f[1]}). "
+                        f"FFM concat={c_shallow + c_deep} -> reduce -> c_out={c2}"
+                    )
                 args = [c_shallow, c_deep, c2]
+                if verbose:
+                    LOGGER.info(
+                        f"    [FFM]  layer {i}: c_shallow={c_shallow} (idx {f[1]}), "
+                        f"c_deep={c_deep} (idx {f[0]}), c_out={c2}"
+                    )
             elif m is ASFF:
+                # ASFF(level, channels_list) — adaptive spatial feature fusion
                 channels_list = [ch_list[x] for x in f]
                 level = args[0]
+                if not isinstance(level, int) or level < 0 or level >= len(channels_list):
+                    raise ValueError(
+                        f"[SiHA-parse] ASFF (layer {i}): level={level} geçersiz! "
+                        f"Geçerli aralık: 0..{len(channels_list)-1}. "
+                        f"from indices: {f}, channels: {channels_list}"
+                    )
+                if any(c <= 0 for c in channels_list):
+                    raise ValueError(
+                        f"[SiHA-parse] ASFF (layer {i}): sıfır/negatif kanal! "
+                        f"channels_list={channels_list} (from indices {f})"
+                    )
                 c2 = channels_list[level]
                 args = [level, channels_list]
+                if verbose:
+                    LOGGER.info(
+                        f"    [ASFF] layer {i}: level={level}, "
+                        f"channels={channels_list}, c_out={c2}"
+                    )
             elif m is CBLinear:
                 c2 = args[0]
                 c1_val = ch_list[f]
@@ -517,11 +579,31 @@ def register():
                 elif isinstance(f, list):
                     c2 = ch_list[f[0]]
 
-            m_ = (
-                torch.nn.Sequential(*(m(*args) for _ in range(n)))
-                if n > 1
-                else m(*args)
-            )
+            # ── Modül oluşturma (fail-fast: kanal hatası burada patlar) ──
+            try:
+                m_ = (
+                    torch.nn.Sequential(*(m(*args) for _ in range(n)))
+                    if n > 1
+                    else m(*args)
+                )
+            except (TypeError, RuntimeError, ValueError) as exc:
+                # Custom modüller için anlaşılır hata mesajı
+                _sigs = {
+                    "CSSF": "CSSF(c_low, c_high, c_out)",
+                    "FFM":  "FFM(c_shallow, c_deep, c_out)",
+                    "ASFF": "ASFF(level, channels_list)",
+                }
+                _sig = _sigs.get(m_str, str(m))
+                raise type(exc)(
+                    f"\n[SiHA-parse] Layer {i} ({m_str}) oluşturulamadı!\n"
+                    f"  Beklenen imza : {_sig}\n"
+                    f"  Verilen args  : {args}\n"
+                    f"  from (f)      : {f}\n"
+                    f"  ch_list (son 5): {ch_list[-5:]}\n"
+                    f"  Orijinal hata : {exc}\n"
+                    f"  Olası sebep   : YAML'daki kanal/indeks tanımı parse "
+                    f"sırasında yanlış çözümlendi."
+                ) from exc
             t = str(m)[8:-2].replace("__main__.", "")
             m_.np = sum(x.numel() for x in m_.parameters())
             m_.i, m_.f, m_.type = i, f, t

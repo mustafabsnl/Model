@@ -9,7 +9,7 @@ Makalelere dayalı modifikasyonlar:
   - BiFPN, Swin-C2f, DSConv, LEM, DilatedConv, CSSF, FFM, ASFF
 """
 
-__version__ = "1.0.0"
+__version__ = "4.0.0"
 
 # Bu paketin eğitim altyapısında yalnızca custom_modules.py kullanılır.
 # Dışarıdan kullanım için register() fonksiyonunu import et:

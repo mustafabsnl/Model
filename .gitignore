@@ -1,0 +1,67 @@
+# ============================================================================
+# SiHA-YOLO .gitignore
+# ============================================================================
+
+# ── Python cache ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+
+# ── Virtual environments ─────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Model weights (buyuk dosyalar) ───────────────────────────
+*.pt
+*.pth
+*.onnx
+*.engine
+*.trt
+*.torchscript
+
+# ── Dataset (cok buyuk — ayri yonetilmeli) ───────────────────
+Dataset/
+dataset/
+data/
+
+# ── Arsiv dosyalari ──────────────────────────────────────────
+*.zip
+*.tar.gz
+*.tar
+*.rar
+*.7z
+archive/
+
+# ── Egitim ciktilari ─────────────────────────────────────────
+runs/
+wandb/
+mlruns/
+*.log
+
+# ── IDE / Editor ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# ── OS dosyalari ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Ultralytics submodule / local kopyasi ────────────────────
+ultralytics/
+
+# ── Diger ────────────────────────────────────────────────────
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.avi
+TRACK/

@@ -2,341 +2,226 @@
 """
 SİHA-YOLO Model Wrapper
 =========================
-YOLOv8 + P2 Head + SimAM + Focal-EIoU
+Model olusturma, predict, validate ve export icin wrapper.
+Egitim icin train.py tek giris noktasidir — bu sinif egitim yapmaz.
 
-Bu sınıf, Ultralytics YOLO API'sini sararak SİHA-YOLO
-modifikasyonlarını eğitim sürecine entegre eder.
-
-Kullanım:
+Kullanim:
     from siha_yolo import SihaYolo
 
-    # Model oluştur
-    model = SihaYolo(
-        data_yaml="path/to/data.yaml",
-        scale="n",           # n=nano (Kaggle T4), s=small, m=medium
-        use_simam=True,      # SimAM dikkat mekanizması
-        use_focal_eiou=True, # Focal-EIoU loss
-    )
-
-    # Eğit
-    model.train(epochs=100, batch=8, imgsz=640)
+    # Model olustur
+    model = SihaYolo(pretrained="yolov8m.pt")
 
     # Tahmin
     results = model.predict("test_image.jpg")
+
+    # Export
+    model.export(format="onnx")
+
+    # Egitim icin:  python train.py --data data.yaml
 """
 
 import sys
 import io
-import torch
-import torch.nn as nn
 from pathlib import Path
-from copy import deepcopy
 
 # Windows terminal encoding fix
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
     sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
-# Custom modüller
-from siha_yolo.modules.simam import SimAM
-from siha_yolo.modules.focal_eiou import FocalEIoULoss
+# Custom modüller — register() YAML parser'a tum custom layer'lari tanitir
+from siha_yolo.custom_modules import register as _register_custom_modules
 
 
 # ============================================================================
 # YAML dosya yolunu bul
 # ============================================================================
 _THIS_DIR = Path(__file__).parent.resolve()
-_YAML_PATH = _THIS_DIR / "siha_yolov8_p2.yaml"
+_YAML_PATH = _THIS_DIR / "siha_yolov8_v4.yaml"
+
+
+# ============================================================================
+# Standalone Pretrained Transfer (2 Fazli Fuzzy Matching)
+# ============================================================================
+
+def load_pretrained_weights(yolo_model, weights_path: str):
+    """
+    YOLO modeline pretrained agirliklari 2 fazli fuzzy matching ile yukler.
+
+    Bu fonksiyon hem SihaYolo wrapper'dan hem de train.py'den
+    dogrudan cagirilabilir — her ikisi de ayni mantigi kullanir.
+
+    Faz 1 — Tam isim eslesmesi:
+      state_dict key birebir ayni + shape ayni → transfer
+
+    Faz 2 — Suffix+shape fuzzy matching:
+      Layer indeksi farkli olsa bile suffix (orn '.cv1.conv.weight')
+      ve shape birebir ayni → transfer.
+      P2 Head / ASFF gibi ek katmanlar indeksleri kaydirdiginda
+      backbone katmanlarini kurtarir.
+
+    Args:
+        yolo_model: Ultralytics YOLO model nesnesi (YOLO(...) ile olusturulmus)
+        weights_path: Pretrained .pt dosya yolu (orn 'yolov8m.pt')
+
+    Returns:
+        dict: Transfer istatistikleri
+              {'exact': int, 'fuzzy': int, 'total': int,
+               'total_params': int, 'pct': float}
+    """
+    import re
+    from ultralytics import YOLO
+
+    ref_model = YOLO(weights_path)
+    state_dict_ref = ref_model.model.state_dict()
+    state_dict_new = yolo_model.model.state_dict()
+
+    # ── Faz 1: Tam isim eslesmesi ──────────────────────────────
+    transferred_exact = 0
+    skipped_shape = []
+    remaining_new = {}
+    remaining_ref = {}
+
+    for key in state_dict_new:
+        if key in state_dict_ref:
+            if state_dict_ref[key].shape == state_dict_new[key].shape:
+                state_dict_new[key] = state_dict_ref[key]
+                transferred_exact += 1
+            else:
+                skipped_shape.append(
+                    f"{key}: ref={tuple(state_dict_ref[key].shape)} "
+                    f"vs new={tuple(state_dict_new[key].shape)}"
+                )
+                remaining_new[key] = state_dict_new[key]
+        else:
+            remaining_new[key] = state_dict_new[key]
+
+    for key in state_dict_ref:
+        if key not in state_dict_new:
+            remaining_ref[key] = state_dict_ref[key]
+
+    # ── Faz 2: Suffix+shape fuzzy matching ─────────────────────
+    def _suffix(k):
+        """model.NN. prefix'ini cikar, suffix'i dondur."""
+        m = re.match(r"^model\.\d+\.", k)
+        return k[m.end():] if m else k
+
+    transferred_fuzzy = 0
+
+    if remaining_new and remaining_ref:
+        ref_by_suffix = {}
+        for rk, rv in remaining_ref.items():
+            s = _suffix(rk)
+            ref_by_suffix.setdefault(s, []).append((rk, rv))
+
+        used_ref_keys = set()
+        for nk in list(remaining_new.keys()):
+            s = _suffix(nk)
+            candidates = ref_by_suffix.get(s, [])
+            for rk, rv in candidates:
+                if rk in used_ref_keys:
+                    continue
+                if rv.shape == state_dict_new[nk].shape:
+                    state_dict_new[nk] = rv
+                    transferred_fuzzy += 1
+                    used_ref_keys.add(rk)
+                    del remaining_new[nk]
+                    break
+
+    # ── Sonuc ──────────────────────────────────────────────────
+    total_new = len(state_dict_new)
+    total_transferred = transferred_exact + transferred_fuzzy
+    transfer_pct = 100.0 * total_transferred / max(total_new, 1)
+
+    yolo_model.model.load_state_dict(state_dict_new, strict=False)
+
+    # ── Rapor ──────────────────────────────────────────────────
+    print(f"\n  [Pretrained] Transfer ozeti ({weights_path}):")
+    print(f"    Faz 1 (tam isim) : {transferred_exact:>4} katman")
+    print(f"    Faz 2 (fuzzy)    : {transferred_fuzzy:>4} katman")
+    print(f"    TOPLAM           : {total_transferred:>4} / {total_new} ({transfer_pct:.1f}%)")
+    print(f"    Shape mismatch   : {len(skipped_shape):>4}")
+    print(f"    Eslesmedi (yeni) : {len(remaining_new):>4} (P2/CSSF/FFM/ASFF vb.)")
+
+    if skipped_shape:
+        print(f"    Shape mismatch ornekleri (ilk 5):")
+        for item in skipped_shape[:5]:
+            print(f"      {item}")
+
+    if transfer_pct < 10.0:
+        print(
+            f"\n  [!] [Pretrained] UYARI: Transfer orani cok dusuk ({transfer_pct:.1f}%)!\n"
+            f"      Oneriler: yolov8n.pt deneyin veya pretrained=False yapin."
+        )
+    elif transfer_pct < 30.0:
+        print(
+            f"\n  [!] [Pretrained] NOT: Transfer orani orta ({transfer_pct:.1f}%).\n"
+            f"      Backbone aktarildi, custom moduller sifirdan."
+        )
+    else:
+        print(f"\n  [OK] [Pretrained] {transfer_pct:.1f}% transfer tamamlandi.")
+
+    del ref_model
+
+    return {
+        "exact": transferred_exact,
+        "fuzzy": transferred_fuzzy,
+        "total": total_transferred,
+        "total_params": total_new,
+        "pct": transfer_pct,
+    }
 
 
 class SihaYolo:
     """
     SİHA-YOLO: TEKNOFEST Savaşan İHA için Özelleştirilmiş YOLOv8
 
-    Modifikasyonlar:
-      Faz 1:
-        - P2 Head: 4 tespit kafası (YAML ile)
-        - SimAM: Parametresiz dikkat mekanizması (wrapper injection)
-        - Focal-EIoU: Küçük nesne regresyon kaybı (callback)
+    Model olusturma, predict, validate ve export wrapper'i.
+    Egitim icin ``python train.py`` kullanin — bu sinif egitim yapmaz.
+
+    Mimari (YAML): P2 Head + SimAM + BiFPN + ASFF (4 kafa).
 
     Args:
-        data_yaml:       Veri seti YAML dosya yolu
-        scale:           Model ölçeği: "n" (nano), "s" (small), "m" (medium)
-        pretrained:      Önceden eğitilmiş ağırlık dosyası (ör: "yolov8n.pt")
-                         None ise ağırlıklar rastgele başlatılır
-        use_simam:       SimAM dikkat mekanizması kullan
-        use_focal_eiou:  Focal-EIoU loss kullan
-        simam_lambda:    SimAM regularizasyon parametresi
-        focal_gamma:     Focal-EIoU gamma değeri
+        yaml_path:  Model YAML dosyasi (None ise varsayilan siha_yolov8_v4.yaml)
+        pretrained:  Pretrained .pt dosyasi (None ise sifirdan)
     """
 
-    def __init__(
-        self,
-        data_yaml=None,
-        scale="n",
-        pretrained="yolov8n.pt",
-        use_simam=True,
-        use_focal_eiou=True,
-        simam_lambda=1e-4,
-        focal_gamma=0.5,
-    ):
+    def __init__(self, yaml_path=None, pretrained="yolov8m.pt"):
         from ultralytics import YOLO
 
-        self.data_yaml = data_yaml
-        self.scale = scale
         self.pretrained = pretrained
-        self.use_simam = use_simam
-        self.use_focal_eiou = use_focal_eiou
-        self.simam_lambda = simam_lambda
-        self.focal_gamma = focal_gamma
 
-        # ── Model Oluşturma ──────────────────────────────────────────
-        yaml_path = str(_YAML_PATH)
+        _register_custom_modules()
+
+        yaml_path = str(yaml_path or _YAML_PATH)
+        self.yaml_path = yaml_path
+
+        model_name = Path(yaml_path).stem
         print(f"\n{'='*60}")
         print(f"  SiHA-YOLO Model Olusturuluyor")
         print(f"{'='*60}")
         print(f"  YAML     : {yaml_path}")
-        print(f"  Olcek    : {scale}")
-        print(f"  SimAM    : {'AKTIF' if use_simam else 'KAPALI'}")
-        print(f"  F-EIoU   : {'AKTIF' if use_focal_eiou else 'KAPALI'}")
+        print(f"  Mimari   : {model_name}")
 
-        # YAML'dan model oluştur (P2 Head dahil)
         self.yolo = YOLO(yaml_path)
 
-        # Ölçeği ayarla (YAML'daki scales bölümünden)
-        # Ultralytics bunu otomatik yapar ama biz override edebiliriz
-
-        # Pretrained ağırlıkları yükle (eşleşen katmanlar transfer edilir)
         if pretrained:
             self._load_pretrained(pretrained)
-
-        # ── Modifikasyonları Uygula ──────────────────────────────────
-        if use_simam:
-            self._inject_simam()
-
-        if use_focal_eiou:
-            print(f"  [F-EIoU] Focal-EIoU loss egitim sirasinda aktif olacak (gamma={focal_gamma})")
 
         print(f"\n  SiHA-YOLO hazir!")
         print(f"{'='*60}\n")
 
     def _load_pretrained(self, weights_path):
         """
-        Önceden eğitilmiş ağırlıkları yükler.
-        P2 Head yüzünden bazı katmanlar eşleşmeyecek — sadece eşleşenler yüklenir.
+        Standalone load_pretrained_weights() fonksiyonuna delege eder.
+        Bu sayede hem wrapper hem train.py ayni 2 fazli mantigi kullanir.
         """
         try:
-            from ultralytics import YOLO
-
-            # Referans model yükle
-            ref_model = YOLO(weights_path)
-
-            # Eşleşen katmanların ağırlıklarını transfer et
-            state_dict_ref = ref_model.model.state_dict()
-            state_dict_new = self.yolo.model.state_dict()
-
-            transferred = 0
-            skipped = 0
-
-            for key in state_dict_new:
-                if key in state_dict_ref and state_dict_ref[key].shape == state_dict_new[key].shape:
-                    state_dict_new[key] = state_dict_ref[key]
-                    transferred += 1
-                else:
-                    skipped += 1
-
-            self.yolo.model.load_state_dict(state_dict_new, strict=False)
-            print(f"  [Pretrained] {transferred} katman aktarildi, {skipped} katman atland (P2 Head yeni)")
-
-            # Referansı temizle
-            del ref_model
-
+            load_pretrained_weights(self.yolo, weights_path)
         except Exception as e:
             print(f"  [Pretrained] UYARI: Agirliklar yuklenemedi: {e}")
             print(f"  [Pretrained] Model sifirdan egitilecek")
 
-    def _inject_simam(self):
-        """
-        Neck kısmındaki C2f bloklarının çıkışına SimAM enjekte eder.
-
-        SimAM, parametresiz olduğu için model boyutunu değiştirmez.
-        Sadece her C2f çıkışına dikkat ağırlıklandırması ekler.
-        """
-        model = self.yolo.model
-        injected_count = 0
-
-        try:
-            # Model sıralı katmanlarını tara
-            # Head kısmındaki C2f bloklarını bul (index 10+)
-            for i, layer in enumerate(model.model):
-                layer_type = type(layer).__name__
-
-                # Sadece Head kısmındaki C2f bloklarına SimAM ekle
-                # Backbone'daki C2f'lere dokunma (pretrained ağırlıkları bozmasın)
-                if 'C2f' in layer_type and i >= 10:
-                    # C2f bloğunun çıkış kanalını bul
-                    out_channels = self._get_output_channels(layer)
-
-                    if out_channels is not None:
-                        # SimAM oluştur
-                        simam = SimAM(e_lambda=self.simam_lambda)
-
-                        # Orijinal forward'ı sakla
-                        original_forward = layer.forward
-
-                        # Yeni forward: C2f çıkışına SimAM uygula
-                        def make_new_forward(orig_fwd, sim):
-                            def new_forward(x):
-                                out = orig_fwd(x)
-                                return sim(out)
-                            return new_forward
-
-                        layer.forward = make_new_forward(original_forward, simam)
-
-                        # SimAM parametrelerini (yok ama olursa diye) modele ekle
-                        model.model.add_module(f'simam_neck_{i}', simam)
-
-                        injected_count += 1
-
-            if injected_count > 0:
-                print(f"  [SimAM] {injected_count} adet C2f bloguna enjekte edildi (Neck)")
-            else:
-                print(f"  [SimAM] UYARI: Hicbir C2f bloguna enjekte edilemedi")
-
-        except Exception as e:
-            print(f"  [SimAM] UYARI: Enjeksiyon basarisiz: {e}")
-
-    @staticmethod
-    def _get_output_channels(layer):
-        """Bir katmanın çıkış kanal sayısını tahmin eder."""
-        # C2f modülünün cv2 (son conv) çıkış kanalını bul
-        try:
-            if hasattr(layer, 'cv2'):
-                for param in layer.cv2.parameters():
-                    if len(param.shape) >= 2:
-                        return param.shape[0]
-            # Fallback: herhangi bir parametreden
-            for param in layer.parameters():
-                if len(param.shape) >= 2:
-                    return param.shape[0]
-        except Exception:
-            pass
-        return None
-
-    # ====================================================================
-    # Eğitim
-    # ====================================================================
-
-    def train(
-        self,
-        epochs=100,
-        batch=8,
-        imgsz=640,
-        workers=4,
-        project="runs/siha_yolo",
-        name="exp",
-        save_period=5,
-        patience=50,
-        optimizer="AdamW",
-        lr0=0.001,
-        amp=True,
-        cache=False,
-        resume=False,
-        # Augmentation
-        mosaic=1.0,
-        mixup=0.15,
-        close_mosaic=10,
-        degrees=10.0,
-        scale=0.5,
-        # Diğer
-        **extra_args,
-    ):
-        """
-        SİHA-YOLO eğitimini başlatır.
-
-        Args:
-            epochs:       Epoch sayısı
-            batch:        Batch boyutu (-1 = AutoBatch)
-            imgsz:        Görsel boyutu
-            workers:      DataLoader worker sayısı
-            project:      Çıktı dizini
-            name:         Deney adı
-            save_period:  Her N epoch'ta checkpoint kaydet
-            patience:     Early stopping patience
-            optimizer:    Optimizer (AdamW önerilir)
-            lr0:          Başlangıç learning rate
-            amp:          Mixed precision (FP16)
-            cache:        Veri cache ("ram", "disk", veya False)
-            resume:       Kaldığı yerden devam
-            mosaic:       Mosaic augmentation oranı (1.0 = %100)
-            mixup:        MixUp augmentation oranı
-            close_mosaic: Son N epoch'ta mosaic kapat
-            degrees:      Rotasyon augmentation (derece)
-            scale:        Ölçek augmentation oranı
-        """
-        if not self.data_yaml:
-            raise ValueError("data_yaml belirtilmedi! SihaYolo(data_yaml='...') seklinde verin.")
-
-        print(f"\n{'='*60}")
-        print(f"  SiHA-YOLO EGITIM BASLIYOR")
-        print(f"{'='*60}")
-        print(f"  Data     : {self.data_yaml}")
-        print(f"  Epochs   : {epochs}")
-        print(f"  Batch    : {batch}")
-        print(f"  imgsz    : {imgsz}")
-        print(f"  Optimizer: {optimizer}")
-        print(f"  SimAM    : {'AKTIF' if self.use_simam else 'KAPALI'}")
-        print(f"  F-EIoU   : {'AKTIF' if self.use_focal_eiou else 'KAPALI'}")
-        print(f"  Mosaic   : {mosaic}")
-        print(f"  MixUp    : {mixup}")
-        print(f"{'='*60}\n")
-
-        train_args = {
-            "data": self.data_yaml,
-            "epochs": epochs,
-            "batch": batch,
-            "imgsz": imgsz,
-            "workers": workers,
-            "project": project,
-            "name": name,
-            "save_period": save_period,
-            "patience": patience,
-            "optimizer": optimizer,
-            "lr0": lr0,
-            "amp": amp,
-            "cache": cache,
-            "resume": resume,
-            "exist_ok": True,
-            "verbose": True,
-            "plots": True,
-            # Augmentation
-            "mosaic": mosaic,
-            "mixup": mixup,
-            "close_mosaic": close_mosaic,
-            "degrees": degrees,
-            "scale": scale,
-            # Loss ağırlıkları
-            "box": 7.5,
-            "cls": 0.5,
-            "dfl": 1.5,
-        }
-        train_args.update(extra_args)
-
-        # Eğitimi başlat
-        try:
-            results = self.yolo.train(**train_args)
-            print(f"\n{'='*60}")
-            print(f"  SiHA-YOLO EGITIM TAMAMLANDI!")
-            print(f"{'='*60}")
-            return results
-
-        except RuntimeError as e:
-            if "out of memory" in str(e).lower():
-                print(f"\n  GPU BELLEK HATASI!")
-                print(f"  Cozum 1: --batch {max(1, batch // 2)}")
-                print(f"  Cozum 2: --imgsz {max(320, imgsz // 2)}")
-                print(f"  Cozum 3: P2 Head cok bellek kullanir — imgsz=480 deneyin")
-            raise
 
     # ====================================================================
     # Doğrulama / Tahmin / Export
@@ -363,15 +248,13 @@ class SihaYolo:
     # ====================================================================
 
     def summary(self):
-        """Model özetini yazdırır."""
+        """Model ozetini yazdirir."""
+        model_name = Path(self.yaml_path).stem
         print(f"\n{'='*60}")
         print(f"  SiHA-YOLO Model Ozeti")
         print(f"{'='*60}")
-        print(f"  Olcek       : {self.scale}")
-        print(f"  YAML        : {_YAML_PATH.name}")
-        print(f"  P2 Head     : AKTIF (4 tespit kafasi)")
-        print(f"  SimAM       : {'AKTIF' if self.use_simam else 'KAPALI'}")
-        print(f"  Focal-EIoU  : {'AKTIF' if self.use_focal_eiou else 'KAPALI'}")
+        print(f"  Mimari      : {model_name}")
+        print(f"  YAML        : {Path(self.yaml_path).name}")
 
         # Parametre sayısı
         total_params = sum(p.numel() for p in self.yolo.model.parameters())
@@ -411,19 +294,9 @@ if __name__ == "__main__":
     print("SiHA-YOLO Model Test")
     print("=" * 60)
 
-    # Model oluştur (veri seti olmadan — sadece yapı testi)
-    model = SihaYolo(
-        data_yaml=None,
-        scale="n",
-        pretrained="yolov8n.pt",
-        use_simam=True,
-        use_focal_eiou=True,
-    )
+    model = SihaYolo(pretrained="yolov8n.pt")
 
-    # Özet
     model.summary()
-
-    # Karşılaştırma
     model.compare_with_baseline()
 
-    print("\n✅ SiHA-YOLO model testi başarılı!")
+    print("\nSiHA-YOLO model testi basarili!")

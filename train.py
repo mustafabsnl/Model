@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-SİHA-YOLO Eğitim Scripti
-==========================
-Özel SİHA-YOLO mimarisi (P2 Head + SimAM + BiFPN + ASFF) ile eğitim.
-GPU profiline göre otomatik ayarlanan, resume destekli, kapsamlı eğitim scripti.
+SiHA-YOLO Egitim Scripti — Tek Giris Noktasi
+===============================================
+Ozel SiHA-YOLO mimarileri (V4, full vb.) ile egitim.
+GPU profiline gore otomatik ayarlanan, resume destekli, kapsamli egitim scripti.
 
 Kullanım:
     # Temel kullanım — SİHA-YOLO mimarisi (varsayılan)
@@ -67,9 +67,10 @@ if _LOCAL_ULTRALYTICS_ROOT.exists():
 # config ve gpu_config modülleri — worker'larda da import edilebilir (sadece sınıf tanımları)
 from config import (
     TrainingConfig, create_config, config_to_train_args,
-    save_config, load_config, print_config
+    save_config, load_config, print_config, validate_consistency
 )
 from gpu_config import list_profiles, detect_gpu, GPU_PROFILES
+from siha_yolo.siha_model import load_pretrained_weights
 
 # Custom modüllerin register() fonksiyonunu import et (çağırma! — main() içinde çağrılacak)
 # Bu sayede DataLoader worker'ları register()'ı çalıştırmaz → [OK] spam'i durur
@@ -92,12 +93,13 @@ def format_duration(seconds: float) -> str:
     return f"{secs}sn"
 
 
-def print_banner():
-    """Baslangic banneri yazdirir."""
+def print_banner(model_path: str = ""):
+    """Baslangic banneri yazdirir. Model varyantina gore dinamik."""
+    model_name = Path(model_path).stem if model_path else "SiHA-YOLO"
     print("")
     print("=" * 60)
     print("    TEKNOFEST SiHA-YOLO Egitim Sistemi")
-    print("    Ozel Mimari: P2 Head + SimAM + BiFPN + ASFF")
+    print(f"    Mimari: {model_name}")
     print("=" * 60)
     print("")
 
@@ -424,19 +426,27 @@ def _generate_val_curves(metrics, snap_dir: Path, data: dict):
 
 def _make_focal_eiou_callback(gamma: float = 0.5):
     """
-    on_train_start callback'i: Ultralytics loss hesaplayıcısındaki bbox_iou
-    çağrısını Focal-EIoU ile değiştiren monkey-patch.
+    on_train_start callback'i: Ultralytics loss hesaplayicisindaki bbox_iou
+    cagrisini Focal-EIoU ile degistiren monkey-patch.
 
     Neden monkey-patch?
-      Ultralytics'in BboxLoss.forward() içindeki iou hesabı doğrudan
-      utils.metrics.bbox_iou'ya bağlı. Biz bu fonksiyonu geçici olarak
-      Focal-EIoU hesabı yapan bir wrapper ile değiştiriyoruz.
-      Bu sayede Ultralytics kaynak koduna dokunmadan entegrasyon sağlanır.
+      Ultralytics'in BboxLoss.forward() icindeki iou hesabi dogrudan
+      utils.metrics.bbox_iou'ya bagli. Biz bu fonksiyonu gecici olarak
+      Focal-EIoU hesabi yapan bir wrapper ile degistiriyoruz.
+      Bu sayede Ultralytics kaynak koduna dokunmadan entegrasyon saglanir.
+
+    Guvenlik katmanlari:
+      1. Patch sonrasi dogrulama — gercekten uygulanip uygulanmadigini kontrol eder
+      2. Smoke test — kucuk tensorle NaN/inf kontrolu yapar
+      3. Fallback — patch basarisizsa standart loss ile devam eder ve ACIK uyari verir
 
     Args:
-        gamma: Focal üssü. 0.5 küçük nesneler için iyi denge noktası.
+        gamma: Focal ussu. 0.5 kucuk nesneler icin iyi denge noktasi.
     """
     import torch
+
+    # Patch'in uygulandigini dogrulamak icin benzersiz marker
+    _PATCH_MARKER = "_siha_focal_eiou_patched"
 
     def _on_train_start(trainer):
         try:
@@ -449,15 +459,15 @@ def _make_focal_eiou_callback(gamma: float = 0.5):
             def _focal_eiou_bbox_iou(box1, box2, xywh=True, GIoU=False,
                                      DIoU=False, CIoU=False, eps=1e-7):
                 """
-                Ultralytics bbox_iou imzasını koruyarak Focal-EIoU döndürür.
-                Validation sırasında (grad kapalı) orijinal IoU'ya geri döner.
+                Ultralytics bbox_iou imzasini koruyarak Focal-EIoU dondurur.
+                Validation sirasinda (grad kapali) orijinal IoU'ya geri doner.
                 """
-                # Validation / NMS / metrik hesabında orijinal bbox_iou kullan
+                # Validation / NMS / metrik hesabinda orijinal bbox_iou kullan
                 if not torch.is_grad_enabled():
                     return _orig_bbox_iou(box1, box2, xywh=xywh,
                                          GIoU=GIoU, DIoU=DIoU, CIoU=CIoU, eps=eps)
 
-                # xywh → xyxy dönüşümü
+                # xywh → xyxy donusumu
                 if xywh:
                     x1 = box1[:, 0] - box1[:, 2] / 2
                     y1 = box1[:, 1] - box1[:, 3] / 2
@@ -476,42 +486,94 @@ def _make_focal_eiou_callback(gamma: float = 0.5):
 
                 _focal_loss_fn.to(pred_xyxy.device)
                 focal_val = _focal_loss_fn(pred_xyxy.float(), gt_xyxy.float())
-                # BboxLoss içi: loss = (1 - iou) → biz iou = 1 - focal_val veriyoruz
+                # BboxLoss ici: loss = (1 - iou) -> biz iou = 1 - focal_val veriyoruz
                 iou_like = 1.0 - focal_val.clamp(0.0, 1.0)
                 return iou_like.to(box1.dtype)
 
-            # ── Patch uygula: hem metrics hem loss modülüne ──────────────
-            # Neden ikisi de?
-            #   BboxLoss (ultralytics/utils/loss.py) dosyanın üstünde şunu yapar:
-            #     from ultralytics.utils.metrics import bbox_iou
-            #   Bu Python'da yerel bir referans oluşturur. Sadece metrics modülünü
-            #   yamayarak bu yerel referansı değiştiremeyiz.
-            #   loss modülünü de yamalayarak ikisini de güvence altına alırız.
-            _metrics_mod.bbox_iou = _focal_eiou_bbox_iou
+            # Marker ekle — dogrulama icin
+            _focal_eiou_bbox_iou._siha_focal_eiou_patched = True
 
+            # ── Patch uygula: hem metrics hem loss modulune ──────────────
+            # Neden ikisi de?
+            #   BboxLoss (ultralytics/utils/loss.py) dosyanin ustunde sunu yapar:
+            #     from ultralytics.utils.metrics import bbox_iou
+            #   Bu Python'da yerel bir referans olusturur. Sadece metrics modulunu
+            #   yamayarak bu yerel referansi degistiremeyiz.
+            #   loss modulunu de yamalayarak ikisini de guvence altina aliriz.
+            _metrics_mod.bbox_iou = _focal_eiou_bbox_iou
+            _metrics_patched = True
+
+            _loss_patched = False
             try:
                 import ultralytics.utils.loss as _loss_mod
                 if hasattr(_loss_mod, "bbox_iou"):
                     _loss_mod.bbox_iou = _focal_eiou_bbox_iou
-            except Exception:
-                pass  # bazı sürümlerde loss.py bbox_iou'yu farklı yerde tutar
+                    _loss_patched = True
+                else:
+                    print("  [!] [Focal-EIoU] loss modulunde bbox_iou bulunamadi — "
+                          "sadece metrics modulu patch'lendi.")
+            except ImportError:
+                print("  [!] [Focal-EIoU] ultralytics.utils.loss import edilemedi — "
+                      "sadece metrics modulu patch'lendi.")
 
-            print(f"🎯 Focal-EIoU Loss aktif (gamma={gamma}) — standart iou yerine kullanılıyor.")
+            # ── Dogrulama 1: Marker kontrolu ─────────────────────────────
+            _m_ok = getattr(_metrics_mod.bbox_iou, _PATCH_MARKER, False)
+            if not _m_ok:
+                print("  [X] [Focal-EIoU] KRITIK: metrics.bbox_iou patch'i UYGULANMADI!")
+                print("      Standart CIoU kullanilacak. Bu bir Ultralytics surum sorunudur.")
+                return
+
+            # ── Dogrulama 2: Smoke test (kucuk tensor) ───────────────────
+            try:
+                _test_pred = torch.tensor([[10.0, 10.0, 20.0, 20.0],
+                                           [30.0, 30.0, 50.0, 50.0]])
+                _test_gt   = torch.tensor([[12.0, 12.0, 22.0, 22.0],
+                                           [32.0, 28.0, 48.0, 52.0]])
+                with torch.enable_grad():
+                    _test_pred.requires_grad_(True)
+                    _test_result = _focal_eiou_bbox_iou(
+                        _test_pred, _test_gt, xywh=False
+                    )
+                if torch.isnan(_test_result).any() or torch.isinf(_test_result).any():
+                    print("  [X] [Focal-EIoU] Smoke test BASARISIZ: NaN/inf uretildi!")
+                    print("      Standart CIoU'ya geri donuluyor.")
+                    _metrics_mod.bbox_iou = _orig_bbox_iou
+                    if _loss_patched:
+                        _loss_mod.bbox_iou = _orig_bbox_iou
+                    return
+            except Exception as smoke_exc:
+                print(f"  [!] [Focal-EIoU] Smoke test hatasi: {smoke_exc}")
+                print("      Patch uygulandi ama runtime davranisi garantisiz.")
+
+            # ── Basari raporu ────────────────────────────────────────────
+            _patch_targets = []
+            if _metrics_patched:
+                _patch_targets.append("metrics")
+            if _loss_patched:
+                _patch_targets.append("loss")
+            print(f"  [OK] Focal-EIoU Loss aktif (gamma={gamma})")
+            print(f"       Patch hedefleri: {', '.join(_patch_targets)}")
+            print(f"       Smoke test: GECTI")
 
         except Exception as exc:
-            print(f"⚠️  Focal-EIoU bağlanamadı, standart loss kullanılacak: {exc}")
+            print(f"  [X] Focal-EIoU baglanamadi, standart loss kullanilacak: {exc}")
+            import traceback
+            traceback.print_exc()
 
     return _on_train_start
 
 
 # ============================================================================
-# Altitude / Motion-Blur Augmentation Callback
+# Distance Simulation / Motion-Blur Augmentation Callback
 # ============================================================================
 
-def _make_altitude_blur_callback(p_altitude: float = 0.3, p_motion: float = 0.2):
+def _make_distance_blur_callback(p_distance: float = 0.3, p_motion: float = 0.2):
     """
     on_train_start callback'i: trainer.preprocess_batch'i monkey-patch ederek
-    her batch'e irtifa simülasyonu ve motion blur uygular.
+    her batch'e uzak hedef (low-resolution) simulasyonu ve motion blur uygular.
+
+    distance_sim: Gorseli kucultup tekrar buyuterek cozunurluk kaybi olusturur.
+    Gercek geometrik irtifa degisimi DEGILDIR — uzak/kucuk hedef hissi verir.
     """
     import random
     import torch.nn.functional as _F
@@ -527,7 +589,7 @@ def _make_altitude_blur_callback(p_altitude: float = 0.3, p_motion: float = 0.2)
 
             b, c, h, w = imgs.shape
 
-            if random.random() < p_altitude:
+            if random.random() < p_distance:
                 s = random.uniform(0.25, 0.5)
                 small = _F.interpolate(imgs, scale_factor=s, mode="bilinear", align_corners=False)
                 batch["img"] = _F.interpolate(small, size=(h, w), mode="bilinear", align_corners=False)
@@ -570,7 +632,11 @@ def run_training(config: TrainingConfig):
     if gpu_info:
         print(f"\n🖥️  GPU: {gpu_info['name']} ({gpu_info['vram_total_gb']} GB)")
         print(f"   CUDA: {gpu_info['cuda_version']} | PyTorch: {gpu_info['torch_version']}")
-    
+
+    # ── Tutarlılık doğrulaması (fail-fast) ───────────────────────
+    print("\n🔍 nc / single_cls / data.yaml tutarlılık kontrolü...")
+    validate_consistency(config)
+
     # ── Çıktı dizinlerini oluştur ────────────────────────────────
     output_dir = Path(config.project) / config.name
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -589,33 +655,49 @@ def run_training(config: TrainingConfig):
         train_args["resume"] = True
     else:
         model = YOLO(config.model)
-        # Eğer mimari .yaml ise ve weights verilmişse yükle
+        # Eğer mimari .yaml ise ve weights verilmişse 2 fazli fuzzy transfer uygula
         if str(config.model).lower().endswith((".yaml", ".yml")) and getattr(config, "weights", ""):
-            print(f"🧩 Pretrained weights yükleniyor: {config.weights}")
-            model = model.load(config.weights)
+            print(f"\n  Pretrained weights yukleniyor (2 fazli fuzzy): {config.weights}")
+            try:
+                load_pretrained_weights(model, config.weights)
+            except Exception as e:
+                print(f"  [!] Pretrained yuklenemedi: {e}")
+                print(f"  [!] Model sifirdan egitilecek.")
         train_args = config_to_train_args(config)
     
-    # ── Snapshot callback ekle ────────────────────────────────────
-    snap_period = config.save_period
+    # ── Snapshot callback ekle (checkpoint_period'dan bagimsiz) ────
+    snap_period = getattr(config, "snapshot_period", 0) or config.save_period
     if snap_period and snap_period > 0:
         snap_train_start, snap_epoch_end = _make_snapshot_callbacks(snap_period, output_dir)
         model.add_callback("on_train_start", snap_train_start)
         model.add_callback("on_fit_epoch_end", snap_epoch_end)
-        print(f"📸 Snapshot sistemi aktif: her {snap_period} epoch'ta tam kayıt (grafikler dahil)")
+        print(f"📸 Snapshot sistemi aktif: her {snap_period} epoch'ta tam kayit")
 
-    # ── SİHA-YOLO v2.0 Hybrid Loss aktif et ───────────────────────
-    from siha_yolo.modules.hybrid_loss import apply_hybrid_loss
-    model.add_callback("on_train_start", apply_hybrid_loss)
+    # ── Loss Stratejisi (tek bir yol — cakisma yok) ────────────────
+    loss_mode = getattr(config, "loss_mode", "focal_eiou")
+    # Deney takibi için: hangi loss_mode çalıştığı ve kaynağı açıkça loglanır.
+    # Config default: "focal_eiou" — override edilmişse validate_consistency uyardı.
+    print(f"\n📋 Loss modu (config.loss_mode = '{loss_mode}'):")
+    if loss_mode == "hybrid":
+        from siha_yolo.modules.hybrid_loss import apply_hybrid_loss
+        model.add_callback("on_train_start", apply_hybrid_loss)
+        print(f"   🔬 HYBRID aktif — Ochiai IoU + GAOC + DR Loss")
+    elif loss_mode == "focal_eiou":
+        focal_gamma = getattr(config, "focal_eiou_gamma", 0.5)
+        model.add_callback("on_train_start", _make_focal_eiou_callback(gamma=focal_gamma))
+        print(f"   🎯 FOCAL-EIoU aktif — gamma={focal_gamma}")
+    else:
+        print(f"   📐 STANDARD — Ultralytics varsayılan CIoU")
 
-    # ── Altitude / Blur augmentation callback ekle ───────────────
-    p_alt = getattr(config, "altitude_aug", 0.0)
+    # ── Distance simulation / Motion blur callback ─────────────────
+    p_dist = getattr(config, "distance_sim_aug", 0.0)
     p_blur = getattr(config, "motion_blur_aug", 0.0)
-    if p_alt > 0 or p_blur > 0:
+    if p_dist > 0 or p_blur > 0:
         model.add_callback(
             "on_train_start",
-            _make_altitude_blur_callback(p_altitude=p_alt, p_motion=p_blur),
+            _make_distance_blur_callback(p_distance=p_dist, p_motion=p_blur),
         )
-        print(f"🌤️  Altitude/Blur augmentation aktif: altitude={p_alt}, motion_blur={p_blur}")
+        print(f"🔭 Distance sim / Motion blur aktif: distance_sim={p_dist}, motion_blur={p_blur}")
 
     # ── Eğitimi başlat ───────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -643,6 +725,7 @@ def run_training(config: TrainingConfig):
         print(f"{'='*60}")
         
         # Eğitim özeti kaydet
+        _loss_mode = getattr(config, "loss_mode", "focal_eiou")
         summary = {
             "completed_at": datetime.now().isoformat(),
             "duration_seconds": round(elapsed, 1),
@@ -652,6 +735,10 @@ def run_training(config: TrainingConfig):
             "epochs": config.epochs,
             "imgsz": config.imgsz,
             "batch": config.batch,
+            "loss_mode": _loss_mode,
+            "hybrid_loss_enabled": _loss_mode == "hybrid",
+            "focal_eiou_gamma": getattr(config, "focal_eiou_gamma", 0.0) if _loss_mode == "focal_eiou" else None,
+            "single_cls": config.single_cls,
             "best_weights": str(output_dir / "weights" / "best.pt"),
             "last_weights": str(output_dir / "weights" / "last.pt"),
         }
@@ -749,8 +836,8 @@ GPU Profilleri:
     basic.add_argument(
         "--model",
         type=str,
-        default="siha_yolo/siha_yolov8_p2.yaml",
-        help="Model mimari dosyası (.yaml) veya ağırlık (.pt). Varsayılan: SİHA-YOLO",
+        default="siha_yolo/siha_yolov8_v4.yaml",
+        help="Model mimari dosyası (.yaml) veya ağırlık (.pt). Varsayılan: SİHA-YOLO V4",
     )
     basic.add_argument(
         "--weights",
@@ -766,6 +853,12 @@ GPU Profilleri:
     training.add_argument("--batch", type=int, default=None, help="Batch size (varsayılan: GPU profiline göre)")
     training.add_argument("--imgsz", type=int, default=None, help="Görsel boyutu (varsayılan: 640)")
     training.add_argument("--workers", type=int, default=None, help="DataLoader worker sayısı")
+    training.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help='CUDA: "0" veya çoklu "0,1". Kaggle 2×T4: --gpu kaggle_2xt4 (device=0,1) veya --device 0,1',
+    )
     training.add_argument("--patience", type=int, default=None, help="Early stopping patience")
     training.add_argument("--optimizer", type=str, default=None, choices=["SGD", "Adam", "AdamW", "auto"], help="Optimizer")
     training.add_argument("--lr0", type=float, default=None, help="Başlangıç learning rate")
@@ -798,6 +891,19 @@ GPU Profilleri:
     advanced.add_argument("--multi-scale", action="store_true", help="Multi-scale training")
     advanced.add_argument("--rect", action="store_true", help="Rectangular training (en-boy oranını koru)")
     advanced.add_argument("--name", type=str, default=None, help="Deney adı (varsayılan: otomatik)")
+    advanced.add_argument(
+        "--loss-mode",
+        type=str,
+        default=None,
+        choices=["hybrid", "focal_eiou", "standard"],
+        help="Kayıp: hybrid, focal_eiou (varsayılan config) veya standard Ultralytics.",
+    )
+    advanced.add_argument(
+        "--focal-eiou-gamma",
+        type=float,
+        default=None,
+        help="Focal-EIoU gamma (yalnızca loss-mode=focal_eiou). Varsayılan: 0.5",
+    )
     
     # Diğer
     other = parser.add_argument_group("Diğer")
@@ -821,10 +927,7 @@ GPU Profilleri:
 
 
 def main():
-    # Custom modülleri ANA SÜREÇTE kaydet (worker'larda çalışmaz)
     _register_custom_modules()
-
-    print_banner()
 
     args = parse_args()
     
@@ -856,6 +959,7 @@ def main():
             "lr0": args.lr0,
             "lrf": args.lrf,
             "warmup_epochs": args.warmup_epochs,
+            "device": args.device,
             "save_period": args.save_period,
             "mosaic": args.mosaic,
             "mixup": args.mixup,
@@ -866,6 +970,8 @@ def main():
             "rect": True if args.rect else None,
             "model": args.model,
             "weights": args.weights,
+            "loss_mode": args.loss_mode,
+            "focal_eiou_gamma": args.focal_eiou_gamma,
         }
         
         for key, value in override_map.items():
@@ -879,7 +985,7 @@ def main():
         config = create_config(gpu_profile=args.gpu, **overrides)
     
     # Model ayarla
-    if args.model:
+    if args.model and not args.load_config:
         config.model = args.model
     if args.weights is not None:
         config.weights = args.weights or ""
@@ -887,6 +993,13 @@ def main():
     # Data ayarla
     if args.data:
         config.data = args.data
+
+    if args.loss_mode:
+        config.loss_mode = args.loss_mode
+    if args.focal_eiou_gamma is not None:
+        config.focal_eiou_gamma = args.focal_eiou_gamma
+    if args.device:
+        config.device = args.device
     
     # Resume ayarla
     if args.resume:
@@ -902,6 +1015,8 @@ def main():
     if args.multi_scale:
         config.multi_scale = True
     
+    print_banner(config.model)
+
     # Doğrulamalar
     if not config.resume:
         config.data = validate_data_path(config.data)

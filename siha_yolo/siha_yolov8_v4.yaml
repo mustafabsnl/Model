@@ -1,7 +1,7 @@
-# SİHA-YOLOv8 — Tam Mimari (P2 Head + Tüm Modüller)
+# SİHA-YOLOv8 V4 — Tam Mimari (P2 Head + Tum Moduller)
 # ====================================================================
 #
-# model_mimari_plan.md'deki tüm modüller implementasyonu:
+# Versiyon: V4 (full pipeline — Hybrid Loss + ASFF + BiFPN + SimAM)
 #
 # BACKBONE: LEM, DSConv, DilatedConv, SwinC2f, C2f, SPPF
 # NECK:     BiFPN (BiFPNAdd), SimAM, CSSF, FFM, ASFF
@@ -9,8 +9,17 @@
 #
 # Toplam 44 layer  |  Scales: n / s / m
 # ====================================================================
+#
+# nc TUTARLILIK NOTU:
+#   Model YAML nc=1  ←→  data.yaml nc=1 names=['UAV']  ←→  config single_cls=True
+#   Tüm üçü TEK SINIF UAV deteksiyonu için hizalanmıştır.
+#   Eğer gelecekte çok sınıf eklenmek istenirse:
+#     1. Buradaki nc değerini artır
+#     2. data.yaml nc + names listesini güncelle
+#     3. config.py single_cls = False yap
+# ====================================================================
 
-nc: 8
+nc: 1  # TEK SINIF: UAV — data.yaml ve config.single_cls ile tutarlı
 
 scales:
   n: [0.33, 0.25, 1024]

@@ -7,6 +7,11 @@ ultralytics>=8.0.0        # YOLO modelleri (YOLOv8)
 torch>=2.0.0              # PyTorch (CUDA versiyonunu ayrıca kurun!)
 torchvision>=0.15.0       # PyTorch görüntü işleme
 
+# ── Track Sistemi (TEKNOFEST UAV Tracker) ────
+filterpy>=1.4.5            # Kalman Filtresi (KalmanFilter sınıfı)
+scipy>=1.10.0              # Hungarian Algorithm (linear_sum_assignment)
+pyyaml>=6.0                # tracker_config.yaml okuma
+
 # ── Sistem İzleme ────────────────────────────
 pynvml>=11.5.0            # NVIDIA GPU izleme (sıcaklık, güç, VRAM)
 psutil>=5.9.0             # CPU/RAM/Disk izleme
