@@ -635,29 +635,28 @@ def run_training(config: TrainingConfig):
         _tasks_file = _tasks.__file__
         with open(_tasks_file, "r", encoding="utf-8") as f:
             _content = f.read()
-
         # Eski patch varsa temizle
         if "# SIHA-YOLO DDP INJECTION" in _content:
             _content = _content.split("# SIHA-YOLO DDP INJECTION")[0]
 
         _abs_dir = Path(__file__).resolve().parent
         
-        # Kesin çözüm: Modülleri direkt tasks.py namespace'ine dahil ediyoruz (globals() içine girer)
+        # Kesin çözüm: Modülleri ve özel parse_model yamamızı DDP worker'lara enjekte et!
         _patch_str = f"""
 # SIHA-YOLO DDP INJECTION
 try:
     import sys
     if '{_abs_dir}' not in sys.path:
         sys.path.insert(0, '{_abs_dir}')
-    from siha_yolo.custom_modules import SimAM, BiFPNAdd, SwinC2f, DSConv, LEM, DilatedConv, CSSF, FFM, ASFF
-    from torchvision.ops import DeformConv2d  # Bazı sistemler torchvision bulamıyor
+    from siha_yolo.custom_modules import register
+    register(verbose=False)
 except Exception as e:
     print(f"\\n[!] SIHA DDP Yama Hatasi (Rank Sürecinde): {{e}}\\n")
 """
         with open(_tasks_file, "w", encoding="utf-8") as f:
             f.write(_content.rstrip() + "\n" + _patch_str)
             
-        print("\n💉 Ultralytics çekirdeğine DDP yaması (v2 mutlak-yol) uygulandı.")
+        print("\n💉 Ultralytics çekirdeğine DDP yaması (v3 register-delege) uygulandı.")
     except Exception as e:
         print(f"\n⚠️ DDP patch uygulanamadı: {e}")
 
