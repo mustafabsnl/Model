@@ -75,10 +75,10 @@ class TrainingConfig:
     data: str = ""                 # data.yaml dosya yolu
     
     # ── Eğitim Parametreleri (150 epoch baseline) ──────────────────
-    epochs: int = 150
-    batch: int = -1                # -1 = GPU'ya gore otomatik (AutoBatch)
-    imgsz: int = 640
-    workers: int = 4
+    epochs: int = 30
+    batch: int = 12                # -1 = GPU'ya gore otomatik (AutoBatch)
+    imgsz: int = 768
+    workers: int = 8
     
     # ── Optimizer ────────────────────────────────────────────────────
     optimizer: str = "AdamW"
@@ -141,7 +141,7 @@ class TrainingConfig:
                                    # (3) data YAML nc+names listesini güncelle,
                                    # (4) single_cls=False yap.
     rect: bool = False             # Rectangular training
-    fraction: float = 1.0          # Veri setinin ne kadarını kullan (0-1)
+    fraction: float = 0.4          # Veri setinin ne kadarını kullan (0-1)
     multi_scale: bool = False      # Multi-scale training
     dropout: float = 0.0           # Dropout oranı (overfitting önleme)
     nbs: int = 64                  # Nominal batch size

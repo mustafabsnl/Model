@@ -1,0 +1,25 @@
+1) Baştaki DDP patch uyarısı hâlâ var
+
+En üstte:
+[!] SIHA DDP Yama Hatasi (Rank Sürecinde): register() got an unexpected keyword argument 'verbose'
+yazıyor. Bu iyi değil, ama şu an eğitimi durdurmuyor çünkü alt tarafta custom modüller yine yüklenmiş. Yani sistem bir yoldan toparlamış. Yine de bu satır, DDP yama kodunda hâlâ temizlenmesi gereken bir uyumsuzluk olduğunu gösteriyor.
+
+2) Dataset karışık format sinyali veriyor
+
+Hem train hem val için şu uyarı var:
+Box and segment counts should be equal ... only boxes will be used and all segments will be removed.
+Bu şu demek:
+
+veri setinde bazı etiketlerde segment/polygon bilgisi var
+ama sen detect eğitimi yapıyorsun
+Ultralytics segmentleri atıp sadece box kullanıyor
+
+Bu eğitim yine yapılır, ama veri setin tam temiz detect formatında değil. Bu, performansı sessizce etkileyebilir. Bence şu an logdaki en önemli veri uyarısı bu.
+
+3) Cache yazılamıyor
+
+Train ve val için cache klasörü writable değil, bu yüzden cache kaydedilmiyor. Bu doğruluğu bozmaz; daha çok hız ve tekrar koşuların verimliliğiyle ilgili.
+
+4) Non-deterministic attention uyarısı
+
+Swin/attention tarafı nedeniyle PyTorch, backward’da non-deterministic memory-efficient attention kullandığını söylüyor. Bu crash değil. Sadece deterministic=True hedefinle tam birebir tekrarlanabilirlik arasında küçük fark olabilir.
